@@ -140,6 +140,7 @@ def plot_shap_single_day(
     df: pd.DataFrame,
     feature_names: list[str],
     save_dir: Path,
+    model: xgb.XGBClassifier = None,
     row_idx: int = -1,
 ):
     """
@@ -150,9 +151,20 @@ def plot_shap_single_day(
         row_idx = len(X) - 1
 
     date_label = str(df.iloc[row_idx]["date"].date()) if "date" in df.columns else f"row {row_idx}"
-    pred_class = int(np.argmax(
-        explainer.model.inplace_predict(X[row_idx:row_idx+1])[0]
-    ))
+
+    # Use the XGBoost model directly for prediction
+    if model is not None:
+        pred_class = int(np.argmax(model.predict_proba(X[row_idx:row_idx+1])[0]))
+    else:
+        # Fallback: derive from SHAP values — class with highest mean positive SHAP
+        if isinstance(shap_values, list):
+            sv_3d = np.stack(shap_values, axis=2)
+        elif shap_values.ndim == 3:
+            sv_3d = shap_values
+        else:
+            sv_3d = shap_values[:, :, np.newaxis]
+        pred_class = int(sv_3d[row_idx].sum(axis=0).argmax())
+
     pred_label = CLASS_NAMES.get(pred_class, str(pred_class))
 
     # Get SHAP values for the predicted class — normalise to (n_samples, n_features, n_classes)
@@ -221,7 +233,7 @@ def main():
 
     # ── SHAP ─────────────────────────────────────────────────────────────────
     fig_summary, explainer, shap_values = plot_shap_summary(model, X, feature_cols, MODELS_DIR)
-    plot_shap_single_day(explainer, shap_values, X, df, feature_cols, MODELS_DIR)
+    plot_shap_single_day(explainer, shap_values, X, df, feature_cols, MODELS_DIR, model=model)
 
     print("\n[evaluate] Done.")
 
