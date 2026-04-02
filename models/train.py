@@ -73,8 +73,12 @@ BASE_PARAMS = {
 def _try_cuda_fallback_cpu(params: dict) -> dict:
     """Return params with device=cpu if CUDA is not available."""
     try:
-        test = xgb.XGBClassifier(**{**params, "n_estimators": 10})
-        test.fit(np.random.rand(20, 4), np.random.randint(0, 3, 20))
+        # Strip early_stopping_rounds for this probe — it requires an eval_set
+        probe_params = {k: v for k, v in params.items() if k != "early_stopping_rounds"}
+        test = xgb.XGBClassifier(**{**probe_params, "n_estimators": 10})
+        X_probe = np.random.rand(20, 4).astype(np.float32)
+        y_probe = np.random.randint(0, 3, 20)
+        test.fit(X_probe, y_probe)
         return params
     except Exception as e:
         if "cuda" in str(e).lower() or "gpu" in str(e).lower():
