@@ -6,13 +6,15 @@ Parameters swept:
   spread_width        : [2, 3, 5 points]
   profit_target       : [50%, 75%, 100%]
   stop_loss           : [50%, 75%, 100%]
-  vix_filter          : [13, 15, 17] (max VIX to trade)
+  vix_filter          : [15, 17, 20, 25, 100]  (100 = no filter)
 
 Saves grid_search/results/sweep.parquet and Plotly heatmaps.
 """
 
-import json
+import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import product
 from pathlib import Path
 
@@ -46,60 +48,84 @@ def _params_to_debit_and_gain(spread_width: int, debit_ratio: float = 0.35):
     return debit, max_gain
 
 
-def run_sweep(df: pd.DataFrame, model: xgb.XGBClassifier, feature_cols: list[str], intraday_df=None):
+def _run_single_combo(
+    params: dict,
+    df: pd.DataFrame,
+    model: xgb.XGBClassifier,
+    feature_cols: list,
+    intraday_df,
+) -> dict | None:
+    """Run one parameter combination and return the result row, or None on error."""
+    debit, max_gain = _params_to_debit_and_gain(int(params["spread_width"]))
+    try:
+        _, summary = run_backtest(
+            df,
+            model,
+            feature_cols,
+            profit_target_pct=params["profit_target_pct"],
+            stop_loss_pct=params["stop_loss_pct"],
+            debit=debit,
+            max_gain=max_gain,
+            spread_width=params["spread_width"],
+            direction_threshold=params["direction_threshold"],
+            vix_filter=params["vix_filter"],
+            intraday_df=intraday_df,
+        )
+        if "error" in summary:
+            return None
+        return {
+            "direction_threshold": params["direction_threshold"],
+            "spread_width": params["spread_width"],
+            "profit_target_pct": params["profit_target_pct"],
+            "stop_loss_pct": params["stop_loss_pct"],
+            "vix_filter": params["vix_filter"],
+            "total_trades": summary["total_trades"],
+            "win_rate": summary["win_rate"],
+            "total_pnl": summary["total_pnl"],
+            "max_drawdown": summary["max_drawdown"],
+            "sharpe": summary["sharpe"],
+            "avg_hold_hours": summary["avg_hold_hours"],
+        }
+    except Exception as e:
+        return {"_error": str(e), **params}
+
+
+def run_sweep(
+    df: pd.DataFrame,
+    model: xgb.XGBClassifier,
+    feature_cols: list[str],
+    intraday_df=None,
+    n_workers: int | None = None,
+):
     keys = list(SWEEP_PARAMS.keys())
-    combos = list(product(*[SWEEP_PARAMS[k] for k in keys]))
-
-    # Add entry_time axis (metadata only — engine doesn't model exact entry time)
-    all_results = []
+    combos = [dict(zip(keys, c)) for c in product(*[SWEEP_PARAMS[k] for k in keys])]
     total = len(combos)
-    print(f"[sweep] Running {total} combinations …")
 
-    for i, combo in enumerate(combos):
-        params = dict(zip(keys, combo))
-        debit, max_gain = _params_to_debit_and_gain(int(params["spread_width"]))
+    workers = n_workers or min(os.cpu_count() or 4, total)
+    print(f"[sweep] Running {total} combinations on {workers} threads …")
 
-        try:
-            _, summary = run_backtest(
-                df,
-                model,
-                feature_cols,
-                profit_target_pct=params["profit_target_pct"],
-                stop_loss_pct=params["stop_loss_pct"],
-                debit=debit,
-                max_gain=max_gain,
-                spread_width=params["spread_width"],
-                direction_threshold=params["direction_threshold"],
-                vix_filter=params["vix_filter"],
-                intraday_df=intraday_df,
-            )
+    all_results = []
+    counter_lock = threading.Lock()
+    completed = [0]
 
-            if "error" in summary:
-                continue
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_run_single_combo, params, df, model, feature_cols, intraday_df): params
+            for params in combos
+        }
+        for future in as_completed(futures):
+            result = future.result()
+            with counter_lock:
+                completed[0] += 1
+                n = completed[0]
+                if n % 50 == 0 or n == total:
+                    print(f"  … {n}/{total} done")
+            if result is not None and "_error" not in result:
+                all_results.append(result)
+            elif result and "_error" in result:
+                print(f"  ERROR: {result['_error']}  params={futures[future]}")
 
-            row = {
-                "direction_threshold": params["direction_threshold"],
-                "spread_width": params["spread_width"],
-                "profit_target_pct": params["profit_target_pct"],
-                "stop_loss_pct": params["stop_loss_pct"],
-                "vix_filter": params["vix_filter"],
-                "total_trades": summary["total_trades"],
-                "win_rate": summary["win_rate"],
-                "total_pnl": summary["total_pnl"],
-                "max_drawdown": summary["max_drawdown"],
-                "sharpe": summary["sharpe"],
-                "avg_hold_hours": summary["avg_hold_hours"],
-            }
-            all_results.append(row)
-
-        except Exception as e:
-            print(f"  ERROR at combo {i+1}: {e}")
-
-        if (i + 1) % 50 == 0:
-            print(f"  … {i+1}/{len(combos)} combos done")
-
-    results_df = pd.DataFrame(all_results)
-    return results_df
+    return pd.DataFrame(all_results)
 
 
 def _pivot_heatmap(
@@ -202,6 +228,14 @@ def generate_heatmaps(results_df: pd.DataFrame):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--workers", type=int, default=None,
+        help="Number of parallel threads (default: CPU count)",
+    )
+    args = parser.parse_args()
+
     print("[sweep] Loading model and test data …")
     model, feature_cols = load_model_and_features()
     df = load_test_features()
@@ -214,7 +248,7 @@ def main():
     else:
         print("  No intraday data — using daily fallback")
 
-    results_df = run_sweep(df, model, feature_cols, intraday_df=intraday_df)
+    results_df = run_sweep(df, model, feature_cols, intraday_df=intraday_df, n_workers=args.workers)
 
     # Save raw results
     out_path = RESULTS_DIR / "sweep.parquet"
