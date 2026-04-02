@@ -142,6 +142,40 @@ def _to_daily_ohlcv(df: pd.DataFrame, ts_col: str) -> pd.DataFrame:
     return daily.reset_index()
 
 
+def _extract_intraday_market_hours(df: pd.DataFrame, ts_col: str) -> pd.DataFrame:
+    """
+    Extract regular market hours bars (9:30am–4:00pm ET) from a minute-resolution DataFrame.
+    Returns columns: ts_et, date, open, high, low, close, volume.
+    """
+    df = df.copy()
+    df[ts_col] = pd.to_datetime(df[ts_col], utc=True)
+    df["ts_et"] = df[ts_col].dt.tz_convert("US/Eastern").dt.tz_localize(None)
+    df["date"] = df["ts_et"].dt.normalize()
+    df["hour"] = df["ts_et"].dt.hour
+    df["minute"] = df["ts_et"].dt.minute
+
+    # Regular market hours: 9:30am to 3:59pm ET inclusive
+    market_mask = (
+        ((df["hour"] == 9) & (df["minute"] >= 30)) |
+        ((df["hour"] >= 10) & (df["hour"] <= 15)) |
+        ((df["hour"] == 15) & (df["minute"] <= 59))
+    )
+    # Simpler: keep 9:30 through 15:59
+    market_mask = (
+        (df["ts_et"].dt.hour * 60 + df["ts_et"].dt.minute >= 9 * 60 + 30) &
+        (df["ts_et"].dt.hour * 60 + df["ts_et"].dt.minute <= 15 * 60 + 59)
+    )
+
+    df = df[market_mask].copy()
+
+    keep_cols = ["ts_et", "date"]
+    for col in ("open", "high", "low", "close", "volume"):
+        if col in df.columns:
+            keep_cols.append(col)
+
+    return df[keep_cols].reset_index(drop=True)
+
+
 def parse_all_dbn_files():
     """Main entry point: scan, parse, route, and save parquet files."""
     dbn_files = list(DBN_DIR.glob("*.dbn")) + list(DBN_DIR.glob("*.dbn.zst"))
@@ -157,6 +191,7 @@ def parse_all_dbn_files():
 
     es_frames = []
     spy_frames = []
+    spy_intraday_frames = []   # 1-minute SPY bars for backtest exit simulation
     es_gap_series = []
 
     for fpath in dbn_files:
@@ -211,6 +246,12 @@ def parse_all_dbn_files():
             print("  WARNING: Could not detect symbol, skipping.")
             continue
 
+        schema_lower = schema.lower()
+        is_minute = "ohlcv-1m" in schema_lower or "ohlcv-1s" in schema_lower
+        is_intraday = is_minute or any(
+            s in schema_lower for s in ("mbp", "ohlcv-1h", "trades", "mbo")
+        )
+
         # Route by symbol
         if _is_es(symbol):
             print(f"  → Routing as ES futures")
@@ -231,6 +272,13 @@ def parse_all_dbn_files():
                 daily = _to_daily_ohlcv(df, ts_col)
                 daily["symbol"] = symbol
                 spy_frames.append(daily)
+
+            # If 1-minute data: also save raw intraday bars for backtest
+            if is_minute and ts_col and "open" in df.columns:
+                intraday = _extract_intraday_market_hours(df, ts_col)
+                if not intraday.empty:
+                    spy_intraday_frames.append(intraday)
+                    print(f"  → Also saving {len(intraday):,} intraday 1-min bars for backtest")
         else:
             print(f"  → Symbol '{symbol}' not matched to ES or SPY, skipping.")
 
@@ -255,7 +303,7 @@ def parse_all_dbn_files():
         print(f"\n[parse_dbn] Saved ES futures → {out_path} ({len(es_df):,} rows)")
         print(f"  date range: {es_df['date'].min()} → {es_df['date'].max()}")
 
-    # --- Save SPY/SPX ---
+    # --- Save SPY/SPX daily ---
     if spy_frames:
         spy_df = pd.concat(spy_frames, ignore_index=True)
         if "date" in spy_df.columns:
@@ -264,8 +312,23 @@ def parse_all_dbn_files():
 
         out_path = RAW_DIR / "spy_daily.parquet"
         spy_df.to_parquet(out_path, index=False)
-        print(f"\n[parse_dbn] Saved SPY/SPX → {out_path} ({len(spy_df):,} rows)")
+        print(f"\n[parse_dbn] Saved SPY/SPX daily → {out_path} ({len(spy_df):,} rows)")
         print(f"  date range: {spy_df['date'].min()} → {spy_df['date'].max()}")
+
+    # --- Save SPY 1-minute intraday (market hours only) ---
+    if spy_intraday_frames:
+        intraday_df = pd.concat(spy_intraday_frames, ignore_index=True)
+        intraday_df["ts_et"] = pd.to_datetime(intraday_df["ts_et"])
+        intraday_df["date"] = pd.to_datetime(intraday_df["date"])
+        # Deduplicate on exact timestamp
+        intraday_df = intraday_df.drop_duplicates(subset=["ts_et"]).sort_values("ts_et")
+
+        out_path = RAW_DIR / "spy_intraday_1m.parquet"
+        intraday_df.to_parquet(out_path, index=False)
+        print(f"\n[parse_dbn] Saved SPY 1-min intraday → {out_path} ({len(intraday_df):,} bars)")
+        print(f"  date range: {intraday_df['date'].min()} → {intraday_df['date'].max()}")
+    else:
+        print("\n[parse_dbn] No 1-minute SPY data found — backtest will use daily OHLCV fallback.")
 
     if not es_frames and not spy_frames:
         print("\n[parse_dbn] No recognised symbols processed. Check your .dbn files.")

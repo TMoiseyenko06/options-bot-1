@@ -24,7 +24,7 @@ import xgboost as xgb
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from backtest.engine import run_backtest, load_model_and_features, load_test_features
+from backtest.engine import run_backtest, load_model_and_features, load_test_features, load_spy_intraday
 
 RESULTS_DIR = PROJECT_ROOT / "grid_search" / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -46,7 +46,7 @@ def _params_to_debit_and_gain(spread_width: int, debit_ratio: float = 0.35):
     return debit, max_gain
 
 
-def run_sweep(df: pd.DataFrame, model: xgb.XGBClassifier, feature_cols: list[str]):
+def run_sweep(df: pd.DataFrame, model: xgb.XGBClassifier, feature_cols: list[str], intraday_df=None):
     keys = list(SWEEP_PARAMS.keys())
     combos = list(product(*[SWEEP_PARAMS[k] for k in keys]))
 
@@ -72,6 +72,7 @@ def run_sweep(df: pd.DataFrame, model: xgb.XGBClassifier, feature_cols: list[str
                     spread_width=params["spread_width"],
                     direction_threshold=params["direction_threshold"],
                     vix_filter=params["vix_filter"],
+                    intraday_df=intraday_df,
                 )
 
                 if "error" in summary:
@@ -208,7 +209,14 @@ def main():
     df = load_test_features()
     print(f"  Test rows: {len(df):,}")
 
-    results_df = run_sweep(df, model, feature_cols)
+    intraday_df = load_spy_intraday()
+    if intraday_df is not None:
+        intraday_df = intraday_df[intraday_df["date"] >= "2023-01-01"]
+        print(f"  Intraday bars: {len(intraday_df):,}")
+    else:
+        print("  No intraday data — using daily fallback")
+
+    results_df = run_sweep(df, model, feature_cols, intraday_df=intraday_df)
 
     # Save raw results
     out_path = RESULTS_DIR / "sweep.parquet"

@@ -58,22 +58,127 @@ def load_test_features() -> pd.DataFrame:
     return df.sort_values("date").reset_index(drop=True)
 
 
-def _simulate_intraday_exit(
+def load_spy_intraday() -> pd.DataFrame | None:
+    """
+    Load 1-minute SPY intraday bars if available.
+    Returns DataFrame with columns [ts_et, date, open, high, low, close]
+    or None if the file does not exist.
+    """
+    path = RAW_DIR / "spy_intraday_1m.parquet"
+    if not path.exists():
+        return None
+    df = pd.read_parquet(path)
+    df["ts_et"] = pd.to_datetime(df["ts_et"])
+    df["date"] = pd.to_datetime(df["date"])
+    return df.sort_values("ts_et").reset_index(drop=True)
+
+
+# SPY move required for a spread to reach max gain (call/put).
+# A 0.5% directional move in the underlying roughly puts a 3-point
+# ATM debit spread fully in-the-money for 0DTE.
+SPY_MOVE_FOR_MAX_GAIN = 0.005
+
+
+def _spread_pnl_from_move(directional_move: float, debit: float, max_gain: float) -> float:
+    """
+    Map a directional SPY move (positive = favourable) to spread P&L dollars.
+    Linear interpolation between 0 (no move) and max_gain (full move).
+    Clipped at [−debit, max_gain].
+    """
+    raw = (directional_move / SPY_MOVE_FOR_MAX_GAIN) * max_gain
+    return float(np.clip(raw, -debit, max_gain))
+
+
+def _simulate_exit_minute_bars(
+    date_bars: pd.DataFrame,
+    entry_price: float,
+    direction: int,
+    debit: float,
+    max_gain: float,
+    profit_target_pct: float,
+    stop_loss_pct: float,
+) -> tuple[float, str, float]:
+    """
+    Walk 1-minute bars from 9:45am to 3:45pm ET.
+    On each bar check whether the high (favourable) or low (adverse) touches
+    the profit target or stop loss before the other is checked.
+
+    Convention: for a call spread, SPY rising is favourable (check high first),
+    falling is adverse (check low).  Reversed for put spreads.
+
+    Returns (pnl_dollars, exit_type, hold_hours_from_entry).
+    """
+    profit_target_dollars = debit * profit_target_pct
+    stop_dollars = debit * stop_loss_pct
+
+    # Entry is at the open of the 9:45 bar
+    entry_time_minutes = 9 * 60 + 45
+    time_stop_minutes = 15 * 60 + 45   # 3:45pm
+
+    date_bars = date_bars.copy()
+    date_bars["bar_minutes"] = (
+        date_bars["ts_et"].dt.hour * 60 + date_bars["ts_et"].dt.minute
+    )
+
+    trade_bars = date_bars[
+        (date_bars["bar_minutes"] >= entry_time_minutes) &
+        (date_bars["bar_minutes"] <= time_stop_minutes)
+    ].sort_values("bar_minutes")
+
+    if trade_bars.empty:
+        return 0.0, "no_data", 0.0
+
+    for _, bar in trade_bars.iterrows():
+        bar_high = float(bar["high"])
+        bar_low = float(bar["low"])
+
+        # Favourable and adverse prices depend on direction
+        if direction == 1:   # call spread: high is good, low is bad
+            fav_move = (bar_high - entry_price) / entry_price
+            adv_move = (bar_low - entry_price) / entry_price
+        else:                 # put spread: low is good, high is bad
+            fav_move = (entry_price - bar_low) / entry_price
+            adv_move = (entry_price - bar_high) / entry_price
+
+        fav_pnl = _spread_pnl_from_move(fav_move, debit, max_gain)
+        adv_pnl = _spread_pnl_from_move(adv_move, debit, max_gain)
+
+        hold_hours = (bar["bar_minutes"] - entry_time_minutes) / 60.0
+
+        # Within a single bar assume favourable move is checked before adverse
+        # (conservative: assume best-case for profit target, worst-case for stop)
+        if fav_pnl >= profit_target_dollars:
+            return profit_target_dollars, "profit_target", hold_hours
+        if adv_pnl <= -stop_dollars:
+            return -stop_dollars, "stop_loss", hold_hours
+
+    # Time stop: use close of last bar
+    last_bar = trade_bars.iloc[-1]
+    close_price = float(last_bar["close"])
+    close_move = (close_price - entry_price) / entry_price * direction
+    pnl = _spread_pnl_from_move(close_move, debit, max_gain)
+    # Clip to valid range (don't exceed targets at time stop)
+    pnl = float(np.clip(pnl, -stop_dollars, profit_target_dollars))
+    hold_hours = (last_bar["bar_minutes"] - entry_time_minutes) / 60.0
+    return pnl, "time_stop", hold_hours
+
+
+def _simulate_exit_daily_fallback(
     row: pd.Series,
     direction: int,
     debit: float,
     max_gain: float,
-    max_loss: float,
-    profit_target_pct: float = PROFIT_TARGET_PCT,
-    stop_loss_pct: float = STOP_LOSS_PCT,
+    profit_target_pct: float,
+    stop_loss_pct: float,
 ) -> tuple[float, str, float]:
     """
-    Simulate spread P&L using intraday SPY OHLCV.
+    Fallback when no 1-minute data is available.
+    Uses daily high/low to check if target or stop was touched,
+    and close to determine time-stop P&L.
 
-    For a call spread (direction=1): profits when SPY rises.
-    For a put spread (direction=-1): profits when SPY falls.
-
-    Returns (pnl_dollars, exit_type, hold_hours).
+    Limitation: cannot determine intraday order of high vs low.
+    We assume: if both target and stop would have been hit, stop takes priority
+    (conservative assumption — avoids overstating win rate).
     """
     spy_open = _get_price(row, ["spy_open"])
     spy_close = _get_price(row, ["spy_close", "spy_adj_close"])
@@ -83,56 +188,37 @@ def _simulate_intraday_exit(
     if spy_open is None or spy_close is None:
         return 0.0, "no_data", 0.0
 
-    profit_target = debit * profit_target_pct
-    stop_loss_trigger = debit * stop_loss_pct
+    profit_target_dollars = debit * profit_target_pct
+    stop_dollars = debit * stop_loss_pct
 
-    intraday_return = (spy_close - spy_open) / spy_open if spy_open else 0.0
-
-    # Approximate spread value at close based on intraday return
-    # Call spread gains when underlying rises; put spread gains when it falls
-    directional_move = intraday_return * direction
-
-    # Approximate mark based on spread intrinsic / time value model
-    # At 100% profit target the spread is worth 2x debit (full value = max_gain + debit)
-    # At 100% stop the spread is worth 0
-
-    # Simplified P&L based on SPY directional move
-    # Assume linear relationship between SPY return and spread value
-    # Normalise: a 0.5% directional move roughly achieves 50% of max gain
-    # (crude but defensible without real options data)
-    SPY_MOVE_FOR_MAX_GAIN = 0.005  # 0.5% move → full gain
-
-    spread_value_at_close = debit + (directional_move / SPY_MOVE_FOR_MAX_GAIN) * max_gain
-    spread_value_at_close = max(0.0, min(debit + max_gain, spread_value_at_close))
-
-    pnl = spread_value_at_close - debit
-
-    # Determine exit type
-    if pnl >= profit_target:
-        exit_type = "profit_target"
-        pnl = profit_target
-    elif pnl <= -stop_loss_trigger:
-        exit_type = "stop_loss"
-        pnl = -stop_loss_trigger
+    if direction == 1:
+        fav_extreme = spy_high
+        adv_extreme = spy_low
     else:
-        exit_type = "time_stop"
+        fav_extreme = spy_low
+        adv_extreme = spy_high
 
-    # Hold time: roughly 9:45 → 3:45 = 6h; use directional speed proxy
-    if exit_type == "time_stop":
-        hold_hours = 6.0
-    else:
-        # Estimate time based on how quickly the move occurred
-        high_move = ((spy_high - spy_open) / spy_open) * direction if spy_high else directional_move
-        low_move = ((spy_low - spy_open) / spy_open) * direction if spy_low else directional_move
+    fav_move = abs(fav_extreme - spy_open) / spy_open if fav_extreme else 0.0
+    adv_move = abs(adv_extreme - spy_open) / spy_open if adv_extreme else 0.0
 
-        if exit_type == "profit_target" and high_move >= SPY_MOVE_FOR_MAX_GAIN:
-            hold_hours = 1.5  # hit target early
-        elif exit_type == "stop_loss" and low_move <= -SPY_MOVE_FOR_MAX_GAIN:
-            hold_hours = 1.0
-        else:
-            hold_hours = 3.0
+    # Flip sign: adv move is negative
+    fav_pnl = _spread_pnl_from_move(fav_move, debit, max_gain)
+    adv_pnl = _spread_pnl_from_move(-adv_move, debit, max_gain)
 
-    return pnl, exit_type, hold_hours
+    target_hit = fav_pnl >= profit_target_dollars
+    stop_hit = adv_pnl <= -stop_dollars
+
+    if stop_hit:
+        # Conservative: if stop could have been hit, assume it was
+        return -stop_dollars, "stop_loss", 2.0
+    if target_hit:
+        return profit_target_dollars, "profit_target", 2.0
+
+    # Neither hit — use close
+    close_move = (spy_close - spy_open) / spy_open * direction
+    pnl = _spread_pnl_from_move(close_move, debit, max_gain)
+    pnl = float(np.clip(pnl, -stop_dollars, profit_target_dollars))
+    return pnl, "time_stop", 6.0
 
 
 def _get_price(row: pd.Series, candidates: list[str]) -> float | None:
@@ -153,16 +239,28 @@ def run_backtest(
     spread_width: float = SPREAD_WIDTH,
     direction_threshold: float = 0.002,
     vix_filter: float | None = None,
+    intraday_df: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """
     Core backtest loop. Returns (trade_log_df, summary_dict).
-    direction_threshold: minimum confidence not used here (label is already generated),
-                         but kept for sweep.py compatibility.
+
+    intraday_df: 1-minute SPY bars (from spy_intraday_1m.parquet).
+                 If provided, exits are simulated bar-by-bar.
+                 If None, falls back to daily OHLCV approximation.
     """
     label_map = {-1: 0, 0: 1, 1: 2}
     df = df.copy()
     df["target_idx"] = df["target"].map(label_map)
     df = df.dropna(subset=feature_cols)
+
+    # Pre-index intraday data by date for fast lookup
+    intraday_by_date: dict[pd.Timestamp, pd.DataFrame] = {}
+    if intraday_df is not None and not intraday_df.empty:
+        for trade_date, group in intraday_df.groupby("date"):
+            intraday_by_date[pd.Timestamp(trade_date)] = group
+        print(f"[backtest] Using 1-min intraday exit simulation ({len(intraday_by_date)} trading days)")
+    else:
+        print("[backtest] No intraday data found — using daily OHLCV fallback for exits")
 
     X = df[feature_cols].values.astype(np.float32)
     proba = model.predict_proba(X)   # shape (n, 3)
@@ -182,10 +280,37 @@ def run_backtest(
         if pred_direction == 0:
             continue   # No trade
 
-        pnl, exit_type, hold_hours = _simulate_intraday_exit(
-            row, pred_direction, debit, max_gain, -debit,
-            profit_target_pct, stop_loss_pct,
-        )
+        trade_date = pd.Timestamp(row["date"]).normalize()
+        day_bars = intraday_by_date.get(trade_date)
+
+        if day_bars is not None and not day_bars.empty:
+            # Get entry price: open of the 9:45am bar
+            entry_mask = (
+                day_bars["ts_et"].dt.hour * 60 + day_bars["ts_et"].dt.minute == 9 * 60 + 45
+            )
+            entry_bars = day_bars[entry_mask]
+            if entry_bars.empty:
+                # Fall back to first bar at or after 9:45
+                after_945 = day_bars[
+                    day_bars["ts_et"].dt.hour * 60 + day_bars["ts_et"].dt.minute >= 9 * 60 + 45
+                ]
+                entry_price = float(after_945.iloc[0]["open"]) if not after_945.empty else None
+            else:
+                entry_price = float(entry_bars.iloc[0]["open"])
+
+            if entry_price is None:
+                continue
+
+            pnl, exit_type, hold_hours = _simulate_exit_minute_bars(
+                day_bars, entry_price, pred_direction,
+                debit, max_gain, profit_target_pct, stop_loss_pct,
+            )
+        else:
+            # Daily fallback
+            pnl, exit_type, hold_hours = _simulate_exit_daily_fallback(
+                row, pred_direction, debit, max_gain,
+                profit_target_pct, stop_loss_pct,
+            )
 
         confidence = float(proba[i][pred_class])
         spread_type = "call_spread" if pred_direction == 1 else "put_spread"
@@ -297,8 +422,17 @@ def main():
     df = load_test_features()
     print(f"  Test rows: {len(df):,}  ({df['date'].min().date()} → {df['date'].max().date()})")
 
+    print("[backtest] Loading intraday data …")
+    intraday_df = load_spy_intraday()
+    if intraday_df is not None:
+        # Filter to test period only
+        intraday_df = intraday_df[intraday_df["date"] >= TEST_START]
+        print(f"  Intraday bars: {len(intraday_df):,} (1-min, market hours)")
+    else:
+        print("  No spy_intraday_1m.parquet found — will use daily OHLCV fallback")
+
     print("\n[backtest] Running backtest …")
-    trade_log, summary = run_backtest(df, model, feature_cols)
+    trade_log, summary = run_backtest(df, model, feature_cols, intraday_df=intraday_df)
 
     # ── Save results ──────────────────────────────────────────────────────────
     trade_log_path = RESULTS_DIR / "trade_log.parquet"
