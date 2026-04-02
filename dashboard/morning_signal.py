@@ -1,11 +1,12 @@
 """
 dashboard/morning_signal.py — Morning signal dashboard.
 
-THIS IS THE ONLY FILE THAT USES DATABENTO_API_KEY AND THE DATABENTO API.
+THIS IS THE ONLY FILE THAT USES DATABENTO_API_KEY AND MASSIVE_API_KEY.
 All other modules read from local files only.
 
-Fetches the last 30 days of ES and SPY data via Databento API,
-fetches VIX/sectors via yfinance, generates today's signal.
+Fetches the last 30 days of SPY data via Databento API,
+fetches VIX/sectors via yfinance, fetches real options chain pricing
+via Massive API, generates today's signal with real strike/debit details.
 """
 
 import json
@@ -16,12 +17,17 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 import xgboost as xgb
 import shap
+from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+# Load .env from project root (never commit .env to git)
+load_dotenv(PROJECT_ROOT / ".env")
 
 MODELS_DIR = PROJECT_ROOT / "models"
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
@@ -36,6 +42,8 @@ from features.engineer import (
 )
 
 DATABENTO_API_KEY = os.environ.get("DATABENTO_API_KEY")
+MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY")
+MASSIVE_BASE_URL = "https://api.massive.com"
 
 LABEL_INV = {0: -1, 1: 0, 2: 1}
 SIGNAL_LABELS = {1: "BUY CALL SPREAD", -1: "BUY PUT SPREAD", 0: "NO TRADE"}
