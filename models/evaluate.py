@@ -95,14 +95,17 @@ def plot_shap_summary(model: xgb.XGBClassifier, X: np.ndarray, feature_names: li
     explainer = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(X)
 
-    # shap_values shape: (n_samples, n_features, n_classes) or list of arrays
+    # Normalise to (n_samples, n_features, n_classes) regardless of SHAP version
     if isinstance(shap_values, list):
-        # list of (n_samples, n_features) per class
-        mean_abs = np.mean([np.abs(sv) for sv in shap_values], axis=0)
+        # list of n_classes arrays each (n_samples, n_features)
+        sv_3d = np.stack(shap_values, axis=2)   # → (n_samples, n_features, n_classes)
+    elif shap_values.ndim == 3:
+        sv_3d = shap_values                      # already (n_samples, n_features, n_classes)
     else:
-        mean_abs = np.mean(np.abs(shap_values), axis=0) if shap_values.ndim == 3 else np.abs(shap_values)
+        sv_3d = shap_values[:, :, np.newaxis]    # 2D → add class dim
 
-    mean_abs_per_feature = mean_abs.mean(axis=0) if mean_abs.ndim == 2 else mean_abs
+    # Mean |SHAP| per feature, averaged over samples and classes → shape (n_features,)
+    mean_abs_per_feature = np.abs(sv_3d).mean(axis=(0, 2))
 
     importance_df = pd.DataFrame({
         "feature": feature_names,
@@ -152,13 +155,14 @@ def plot_shap_single_day(
     ))
     pred_label = CLASS_NAMES.get(pred_class, str(pred_class))
 
-    # Get SHAP values for the predicted class
+    # Get SHAP values for the predicted class — normalise to (n_samples, n_features, n_classes)
     if isinstance(shap_values, list):
-        sv_day = shap_values[pred_class][row_idx]
+        sv_3d = np.stack(shap_values, axis=2)
     elif shap_values.ndim == 3:
-        sv_day = shap_values[row_idx, :, pred_class]
+        sv_3d = shap_values
     else:
-        sv_day = shap_values[row_idx]
+        sv_3d = shap_values[:, :, np.newaxis]
+    sv_day = sv_3d[row_idx, :, pred_class]
 
     feat_df = pd.DataFrame({
         "feature": feature_names,
