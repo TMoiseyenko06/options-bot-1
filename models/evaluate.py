@@ -207,8 +207,8 @@ def main():
 
     # Save report
     report_path = MODELS_DIR / "classification_report.txt"
-    with open(report_path, "w") as f:
-        f.write(f"Test Set: {TEST_START} → present\n\n")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(f"Test Set: {TEST_START} -> present\n\n")
         f.write(report)
     print(f"[evaluate] Report saved → {report_path}")
 
