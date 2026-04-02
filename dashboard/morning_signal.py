@@ -29,6 +29,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # Load .env from project root (never commit .env to git)
 load_dotenv(PROJECT_ROOT / ".env")
 
+from dashboard.telegram import send_signal, send_error
+
 MODELS_DIR = PROJECT_ROOT / "models"
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
@@ -441,6 +443,7 @@ def main():
         print(f"[morning_signal] ERROR building features: {e}")
         import traceback
         traceback.print_exc()
+        send_error(f"Feature build failed:\n{e}")
         sys.exit(1)
 
     # Generate signal
@@ -449,6 +452,9 @@ def main():
 
     # Print to terminal
     print_signal(result)
+
+    # Send to Telegram
+    send_signal(result)
 
     # Save today's signal
     sig_path = PROJECT_ROOT / "dashboard" / "last_signal.json"
