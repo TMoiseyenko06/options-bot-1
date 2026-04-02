@@ -23,8 +23,8 @@ from backtest.engine import (
     load_model_and_features,
     load_spy_intraday,
     load_test_features,
-    _params_to_debit_and_gain,
 )
+from grid_search.sweep import _params_to_debit_and_gain
 
 SWEEP_PATH = PROJECT_ROOT / "grid_search" / "results" / "sweep.parquet"
 RESULTS_DIR = PROJECT_ROOT / "backtest" / "results"
