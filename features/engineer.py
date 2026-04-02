@@ -134,9 +134,8 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["spy_dist_ma20"] = (df[spy_close] - df["spy_ma20"]) / df["spy_ma20"] * 100
     df = df.drop(columns=["spy_ma20"])
 
-    # Overnight ES gap (already computed in parse_dbn or fallback)
+    # Overnight gap — use ES if available, else fall back to SPY open vs prior close
     if "es_overnight_gap" not in df.columns:
-        # Fallback: compute from ES daily if available
         es_open = _find_col(df, ["es_open"], required=False)
         es_close = _find_col(df, ["es_close"], required=False)
         if es_open and es_close:
@@ -144,7 +143,10 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
                 (df[es_open] - df[es_close].shift(1)) / df[es_close].shift(1)
             )
         else:
-            df["es_overnight_gap"] = np.nan
+            # SPY open vs prior SPY close — good enough without ES data
+            df["es_overnight_gap"] = (
+                (df[spy_open] - df[spy_close].shift(1)) / df[spy_close].shift(1)
+            )
 
     # ── Volatility features ──────────────────────────────────────────────────
     vix_close = _find_col(df, ["vix_close", "vix_vix_close"])

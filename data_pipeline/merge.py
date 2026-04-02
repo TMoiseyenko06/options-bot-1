@@ -15,9 +15,12 @@ PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _load_parquet(path: Path, label: str) -> pd.DataFrame:
+def _load_parquet(path: Path, label: str, required: bool = True) -> pd.DataFrame | None:
     if not path.exists():
-        raise FileNotFoundError(f"[merge] Required file not found: {path}\nRun the data pipeline first.")
+        if required:
+            raise FileNotFoundError(f"[merge] Required file not found: {path}\nRun the data pipeline first.")
+        print(f"[merge] Optional file not found, skipping: {path.name}")
+        return None
     df = pd.read_parquet(path)
     print(f"[merge] Loaded {label}: {len(df):,} rows")
     df["date"] = pd.to_datetime(df["date"]).dt.normalize()
@@ -27,21 +30,15 @@ def _load_parquet(path: Path, label: str) -> pd.DataFrame:
 def main():
     print("[merge] Loading raw parquet files …")
 
-    spy = _load_parquet(RAW_DIR / "spy_daily.parquet", "SPY/SPX")
-    es = _load_parquet(RAW_DIR / "es_futures_daily.parquet", "ES futures")
-    vix = _load_parquet(RAW_DIR / "vix_daily.parquet", "VIX")
-    sectors = _load_parquet(RAW_DIR / "sectors_daily.parquet", "Sectors")
+    spy = _load_parquet(RAW_DIR / "spy_daily.parquet", "SPY/SPX", required=True)
+    es = _load_parquet(RAW_DIR / "es_futures_daily.parquet", "ES futures", required=False)
+    vix = _load_parquet(RAW_DIR / "vix_daily.parquet", "VIX", required=True)
+    sectors = _load_parquet(RAW_DIR / "sectors_daily.parquet", "Sectors", required=True)
 
     # ── Standardise SPY columns ──────────────────────────────────────────────
     spy = spy.rename(columns={c: f"spy_{c}" for c in spy.columns
                                if c not in ("date", "symbol") and not c.startswith("spy_")})
     spy = spy.drop(columns=["symbol"], errors="ignore")
-
-    # ── Standardise ES columns ───────────────────────────────────────────────
-    es = es.rename(columns={c: f"es_{c}" for c in es.columns
-                              if c not in ("date", "symbol", "es_overnight_gap")
-                              and not c.startswith("es_")})
-    es = es.drop(columns=["symbol"], errors="ignore")
 
     # ── Use SPY calendar as anchor ───────────────────────────────────────────
     print("\n[merge] Aligning to SPY trading calendar …")
@@ -49,7 +46,17 @@ def main():
 
     # Merge all datasets
     df = base.merge(spy, on="date", how="left")
-    df = df.merge(es, on="date", how="left")
+
+    if es is not None:
+        es = es.rename(columns={c: f"es_{c}" for c in es.columns
+                                  if c not in ("date", "symbol", "es_overnight_gap")
+                                  and not c.startswith("es_")})
+        es = es.drop(columns=["symbol"], errors="ignore")
+        df = df.merge(es, on="date", how="left")
+        print("[merge] ES futures merged (overnight gap available)")
+    else:
+        print("[merge] No ES data — overnight gap will be computed from SPY open/close in engineer.py")
+
     df = df.merge(vix, on="date", how="left")
     df = df.merge(sectors, on="date", how="left")
 
