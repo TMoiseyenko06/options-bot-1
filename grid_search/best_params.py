@@ -1,0 +1,155 @@
+"""
+grid_search/best_params.py — Extract the best parameter combination from sweep results
+and run a detailed backtest with it.
+
+Usage:
+    python grid_search/best_params.py
+    python grid_search/best_params.py --metric win_rate
+    python grid_search/best_params.py --metric total_pnl
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from backtest.engine import (
+    run_backtest,
+    load_model_and_features,
+    load_spy_intraday,
+    load_test_features,
+    _params_to_debit_and_gain,
+)
+
+SWEEP_PATH = PROJECT_ROOT / "grid_search" / "results" / "sweep.parquet"
+RESULTS_DIR = PROJECT_ROOT / "backtest" / "results"
+
+TEST_START = "2023-01-01"
+
+
+def load_sweep() -> pd.DataFrame:
+    if not SWEEP_PATH.exists():
+        raise FileNotFoundError(f"No sweep results found at {SWEEP_PATH}\nRun: python grid_search/sweep.py")
+    return pd.read_parquet(SWEEP_PATH)
+
+
+def print_best(best: pd.Series, metric: str):
+    print(f"\n{'='*55}")
+    print(f"  BEST PARAMETERS  (ranked by {metric})")
+    print(f"{'='*55}")
+    print(f"  spread_width       : {int(best['spread_width'])} points")
+    print(f"  profit_target      : {best['profit_target_pct']:.0%}")
+    print(f"  stop_loss          : {best['stop_loss_pct']:.0%}")
+    print(f"  vix_filter         : VIX < {best['vix_filter']}")
+    print(f"  direction_threshold: {best['direction_threshold']:.1%}")
+    print(f"\n  Sweep metrics:")
+    print(f"    win_rate   : {best['win_rate']:.1%}")
+    print(f"    sharpe     : {best['sharpe']:.3f}")
+    print(f"    total_pnl  : ${best['total_pnl']:.2f}")
+    print(f"    max_dd     : ${best['max_drawdown']:.2f}")
+    print(f"    trades     : {int(best['total_trades'])}")
+    print(f"{'='*55}\n")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--metric",
+        default="sharpe",
+        choices=["sharpe", "win_rate", "total_pnl"],
+        help="Metric to rank combinations by (default: sharpe)",
+    )
+    args = parser.parse_args()
+
+    print(f"[best_params] Loading sweep results …")
+    sweep = load_sweep()
+    print(f"  {len(sweep):,} combinations found")
+
+    # Pick best
+    best = sweep.nlargest(1, args.metric).iloc[0]
+    print_best(best, args.metric)
+
+    # Also show top 5 for context
+    print(f"Top 5 by {args.metric}:")
+    cols = ["spread_width", "profit_target_pct", "stop_loss_pct",
+            "vix_filter", "win_rate", "sharpe", "total_pnl", "total_trades"]
+    print(sweep.nlargest(5, args.metric)[cols].to_string(index=False))
+
+    print(f"\n[best_params] Running detailed backtest with best params …")
+    model, feature_cols = load_model_and_features()
+    df = load_test_features()
+
+    intraday_df = load_spy_intraday()
+    if intraday_df is not None:
+        intraday_df = intraday_df[intraday_df["date"] >= TEST_START]
+
+    spread_width = int(best["spread_width"])
+    debit = spread_width * 0.35 * 100
+    max_gain = spread_width * 100 - debit
+
+    trade_log, summary = run_backtest(
+        df,
+        model,
+        feature_cols,
+        profit_target_pct=float(best["profit_target_pct"]),
+        stop_loss_pct=float(best["stop_loss_pct"]),
+        debit=debit,
+        max_gain=max_gain,
+        spread_width=spread_width,
+        direction_threshold=float(best["direction_threshold"]),
+        vix_filter=float(best["vix_filter"]),
+        intraday_df=intraday_df,
+    )
+
+    print(f"\n{'='*55}")
+    print(f"  DETAILED BACKTEST RESULTS (2023-present)")
+    print(f"{'='*55}")
+    print(f"  Total trades   : {summary['total_trades']}")
+    print(f"  Win rate       : {summary['win_rate']:.1%}")
+    print(f"  Total P&L      : ${summary['total_pnl']:.2f}")
+    print(f"  Max drawdown   : ${summary['max_drawdown']:.2f}")
+    print(f"  Sharpe ratio   : {summary['sharpe']:.3f}")
+    print(f"  Avg hold time  : {summary['avg_hold_hours']:.1f}h")
+
+    print(f"\n  Win rate by direction:")
+    for d, s in summary["win_rate_by_direction"].items():
+        label = "CALL" if int(d) == 1 else "PUT"
+        print(f"    {label}: {s['win_rate']:.1%}  ({s['trades']} trades)")
+
+    print(f"\n  Win rate by VIX regime:")
+    for regime, s in summary["win_rate_by_vix_regime"].items():
+        print(f"    VIX {regime}: {s['win_rate']:.1%}  ({s['trades']} trades)")
+
+    print(f"\n  Exit type breakdown:")
+    for etype, cnt in summary["exit_type_counts"].items():
+        print(f"    {etype}: {cnt}")
+
+    # Save best params for reference
+    best_params_out = {
+        "spread_width": spread_width,
+        "profit_target_pct": float(best["profit_target_pct"]),
+        "stop_loss_pct": float(best["stop_loss_pct"]),
+        "vix_filter": float(best["vix_filter"]),
+        "direction_threshold": float(best["direction_threshold"]),
+        "ranked_by": args.metric,
+        "sweep_sharpe": float(best["sharpe"]),
+        "sweep_win_rate": float(best["win_rate"]),
+    }
+    out_path = PROJECT_ROOT / "grid_search" / "results" / "best_params.json"
+    with open(out_path, "w") as f:
+        json.dump(best_params_out, f, indent=2)
+    print(f"\n[best_params] Best params saved -> {out_path}")
+
+    # Save trade log
+    tl_path = RESULTS_DIR / "best_trade_log.parquet"
+    trade_log.to_parquet(tl_path, index=False)
+    print(f"[best_params] Trade log saved -> {tl_path}")
+
+
+if __name__ == "__main__":
+    main()

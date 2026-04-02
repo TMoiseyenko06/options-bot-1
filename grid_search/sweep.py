@@ -52,50 +52,48 @@ def run_sweep(df: pd.DataFrame, model: xgb.XGBClassifier, feature_cols: list[str
 
     # Add entry_time axis (metadata only — engine doesn't model exact entry time)
     all_results = []
-    total = len(combos) * len(ENTRY_TIMES)
+    total = len(combos)
     print(f"[sweep] Running {total} combinations …")
 
     for i, combo in enumerate(combos):
         params = dict(zip(keys, combo))
         debit, max_gain = _params_to_debit_and_gain(int(params["spread_width"]))
 
-        for entry_time in ENTRY_TIMES:
-            try:
-                _, summary = run_backtest(
-                    df,
-                    model,
-                    feature_cols,
-                    profit_target_pct=params["profit_target_pct"],
-                    stop_loss_pct=params["stop_loss_pct"],
-                    debit=debit,
-                    max_gain=max_gain,
-                    spread_width=params["spread_width"],
-                    direction_threshold=params["direction_threshold"],
-                    vix_filter=params["vix_filter"],
-                    intraday_df=intraday_df,
-                )
+        try:
+            _, summary = run_backtest(
+                df,
+                model,
+                feature_cols,
+                profit_target_pct=params["profit_target_pct"],
+                stop_loss_pct=params["stop_loss_pct"],
+                debit=debit,
+                max_gain=max_gain,
+                spread_width=params["spread_width"],
+                direction_threshold=params["direction_threshold"],
+                vix_filter=params["vix_filter"],
+                intraday_df=intraday_df,
+            )
 
-                if "error" in summary:
-                    continue
+            if "error" in summary:
+                continue
 
-                row = {
-                    "direction_threshold": params["direction_threshold"],
-                    "spread_width": params["spread_width"],
-                    "profit_target_pct": params["profit_target_pct"],
-                    "stop_loss_pct": params["stop_loss_pct"],
-                    "vix_filter": params["vix_filter"],
-                    "entry_time": entry_time,
-                    "total_trades": summary["total_trades"],
-                    "win_rate": summary["win_rate"],
-                    "total_pnl": summary["total_pnl"],
-                    "max_drawdown": summary["max_drawdown"],
-                    "sharpe": summary["sharpe"],
-                    "avg_hold_hours": summary["avg_hold_hours"],
-                }
-                all_results.append(row)
+            row = {
+                "direction_threshold": params["direction_threshold"],
+                "spread_width": params["spread_width"],
+                "profit_target_pct": params["profit_target_pct"],
+                "stop_loss_pct": params["stop_loss_pct"],
+                "vix_filter": params["vix_filter"],
+                "total_trades": summary["total_trades"],
+                "win_rate": summary["win_rate"],
+                "total_pnl": summary["total_pnl"],
+                "max_drawdown": summary["max_drawdown"],
+                "sharpe": summary["sharpe"],
+                "avg_hold_hours": summary["avg_hold_hours"],
+            }
+            all_results.append(row)
 
-            except Exception as e:
-                print(f"  ERROR at combo {i+1}: {e}")
+        except Exception as e:
+            print(f"  ERROR at combo {i+1}: {e}")
 
         if (i + 1) % 50 == 0:
             print(f"  … {i+1}/{len(combos)} combos done")
