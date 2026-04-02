@@ -60,9 +60,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--metric",
-        default="sharpe",
-        choices=["sharpe", "win_rate", "total_pnl"],
-        help="Metric to rank combinations by (default: sharpe)",
+        default="combined",
+        choices=["sharpe", "win_rate", "total_pnl", "combined"],
+        help="Metric to rank by. 'combined' maximises win_rate x total_pnl (default)",
     )
     args = parser.parse_args()
 
@@ -70,15 +70,31 @@ def main():
     sweep = load_sweep()
     print(f"  {len(sweep):,} combinations found")
 
-    # Pick best
-    best = sweep.nlargest(1, args.metric).iloc[0]
-    print_best(best, args.metric)
+    # Combined score: normalise win_rate and total_pnl to [0,1] then multiply
+    # This rewards combos that are strong on both axes, not just one
+    if args.metric == "combined":
+        sweep["_wr_norm"] = (sweep["win_rate"] - sweep["win_rate"].min()) / (
+            sweep["win_rate"].max() - sweep["win_rate"].min() + 1e-9
+        )
+        sweep["_pnl_norm"] = (sweep["total_pnl"] - sweep["total_pnl"].min()) / (
+            sweep["total_pnl"].max() - sweep["total_pnl"].min() + 1e-9
+        )
+        sweep["combined_score"] = sweep["_wr_norm"] * sweep["_pnl_norm"]
+        rank_col = "combined_score"
+        label = "combined (win_rate x total_pnl)"
+    else:
+        rank_col = args.metric
+        label = args.metric
 
-    # Also show top 5 for context
-    print(f"Top 5 by {args.metric}:")
+    best = sweep.nlargest(1, rank_col).iloc[0]
+    print_best(best, label)
+
+    # Top 10 for context — sorted by trade count so you can see the "more trades" options too
+    print(f"Top 10 by {label}  (sorted by trade count descending):")
     cols = ["spread_width", "profit_target_pct", "stop_loss_pct",
-            "vix_filter", "win_rate", "sharpe", "total_pnl", "total_trades"]
-    print(sweep.nlargest(5, args.metric)[cols].to_string(index=False))
+            "vix_filter", "total_trades", "win_rate", "sharpe", "total_pnl"]
+    top10 = sweep.nlargest(10, rank_col)[cols].sort_values("total_trades", ascending=False)
+    print(top10.to_string(index=False))
 
     print(f"\n[best_params] Running detailed backtest with best params …")
     model, feature_cols = load_model_and_features()

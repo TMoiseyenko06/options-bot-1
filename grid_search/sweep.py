@@ -34,10 +34,10 @@ SWEEP_PARAMS = {
     "spread_width": [2, 3, 5],
     "profit_target_pct": [0.50, 0.75, 1.00],
     "stop_loss_pct": [0.50, 0.75, 1.00],
-    "vix_filter": [13, 15, 17],
+    # Extended VIX filter range — higher values = more trades allowed
+    # 100 = effectively no VIX filter (trade regardless of vol regime)
+    "vix_filter": [15, 17, 20, 25, 100],
 }
-
-ENTRY_TIMES = ["09:30", "09:45", "10:00"]  # stored as metadata; engine uses 9:45 internally
 
 
 def _params_to_debit_and_gain(spread_width: int, debit_ratio: float = 0.35):
