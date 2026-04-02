@@ -60,7 +60,6 @@ def _download(ticker: str, start: str, end: str) -> pd.DataFrame:
         end=end,
         auto_adjust=True,
         progress=False,
-        show_errors=True,
     )
     if raw.empty:
         print("EMPTY")
