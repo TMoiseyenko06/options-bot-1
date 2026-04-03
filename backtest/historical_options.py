@@ -18,8 +18,11 @@ from typing import Optional
 import pytz
 import requests
 import pandas as pd
+from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / ".env")
+
 CACHE_DIR = PROJECT_ROOT / "data" / "cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_PATH = CACHE_DIR / "options_prices.parquet"
