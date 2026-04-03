@@ -29,8 +29,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # Load .env from project root (never commit .env to git)
 load_dotenv(PROJECT_ROOT / ".env")
 
-from dashboard.telegram import send_signal, send_error
-
 MODELS_DIR = PROJECT_ROOT / "models"
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
@@ -43,9 +41,11 @@ from features.engineer import (
     _find_col,
 )
 
+from dashboard.telegram import send_signal, send_error
+from dashboard.massive import get_trade_details
+
 DATABENTO_API_KEY = os.environ.get("DATABENTO_API_KEY")
 MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY")
-MASSIVE_BASE_URL = "https://api.massive.com"
 
 LABEL_INV = {0: -1, 1: 0, 2: 1}
 SIGNAL_LABELS = {1: "BUY CALL SPREAD", -1: "BUY PUT SPREAD", 0: "NO TRADE"}
@@ -350,6 +350,45 @@ def print_signal(result: dict):
         for f in result["active_filters"]:
             print(f"    ⚠  {f}")
 
+    # Options pricing from Massive API
+    pricing = result.get("options_pricing")
+    if pricing:
+        line2 = "-" * 60
+        print(f"\n  {line2}")
+        print(f"  TRADE TICKET")
+        print(f"  {line2}")
+        print(f"    Underlying    : {pricing['underlying']}  @ {pricing['underlying_price']:.2f}")
+        print(f"    Type          : {pricing['contract_type'].upper()} DEBIT SPREAD")
+        print(f"    Long strike   : {pricing['long_strike']:.0f}  ({pricing['long_ticker']})")
+        print(f"    Short strike  : {pricing['short_strike']:.0f}  ({pricing['short_ticker']})")
+        print(f"    Expiry        : {pricing['expiry']}  (0DTE)")
+        print(f"    Entry window  : 9:45am ET")
+        print(f"")
+        if pricing["debit_dollars"] is not None:
+            print(f"    Debit paid    : ${pricing['debit_dollars']:.2f}  (${pricing['debit_per_share']:.2f}/share)")
+            print(f"    Max gain      : ${pricing['max_gain_dollars']:.2f}")
+            print(f"    Max loss      : ${pricing['max_loss_dollars']:.2f}")
+            print(f"    Breakeven     : {pricing['breakeven']:.2f}")
+            rr = pricing['max_gain_dollars'] / pricing['max_loss_dollars'] if pricing['max_loss_dollars'] else 0
+            print(f"    Risk/reward   : {rr:.2f}x")
+        print(f"")
+        if pricing["long_bid"] is not None:
+            print(f"    Long  leg b/a : {pricing['long_bid']:.2f} / {pricing['long_ask']:.2f}  (mid {pricing['long_mid']:.2f})")
+        if pricing["short_bid"] is not None:
+            print(f"    Short leg b/a : {pricing['short_bid']:.2f} / {pricing['short_ask']:.2f}  (mid {pricing['short_mid']:.2f})")
+        if pricing.get("long_iv"):
+            print(f"    Long IV       : {pricing['long_iv']:.1%}")
+        if pricing.get("net_delta") is not None:
+            print(f"    Net delta     : {pricing['net_delta']:+.4f}")
+            print(f"    Net theta     : {pricing['net_theta']:+.4f}  (per day)")
+        if pricing.get("long_oi"):
+            print(f"    Long OI       : {pricing['long_oi']:,}")
+            print(f"    Short OI      : {pricing['short_oi']:,}")
+        print(f"  {line2}")
+    elif result["signal"] != "NO TRADE":
+        print(f"\n  [No options pricing — set MASSIVE_API_KEY in .env for real quotes]")
+
+
     print(f"\n{line}\n")
 
 
@@ -449,6 +488,27 @@ def main():
     # Generate signal
     print("[morning_signal] Generating signal …")
     result = generate_signal(today_features, model, feature_cols)
+
+    # Fetch real options pricing via Massive API (only if signal is directional)
+    result["options_pricing"] = None
+    if result["signal"] != "NO TRADE" and MASSIVE_API_KEY:
+        print("\n[morning_signal] Fetching options pricing via Massive API …")
+        direction = 1 if "CALL" in result["signal"] else -1
+        # Get current SPX price from today's features
+        spy_close_col = next(
+            (c for c in today_features.columns if "spy_close" in c.lower()), None
+        )
+        current_price = float(today_features[spy_close_col].values[0]) if spy_close_col else None
+        if current_price:
+            # SPX trades at ~10x SPY
+            spx_price = current_price * 10
+            result["options_pricing"] = get_trade_details(
+                direction=direction,
+                current_spx_price=spx_price,
+                spread_width=5,
+            )
+        else:
+            print("  WARNING: Could not determine current price for strike selection")
 
     # Print to terminal
     print_signal(result)

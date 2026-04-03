@@ -110,6 +110,36 @@ def format_signal_message(result: dict) -> str:
         for f in result["active_filters"]:
             lines.append(f"  ⚠ {f}")
 
+    # Options trade ticket from Massive API
+    p = result.get("options_pricing")
+    if p:
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"<b>TRADE TICKET</b>")
+        lines.append(f"  {p['underlying']} @ {p['underlying_price']:.2f}")
+        lines.append(f"  {p['contract_type'].upper()} DEBIT SPREAD  |  0DTE")
+        lines.append(f"  Long:  <code>{p['long_strike']:.0f}</code>  ({p['long_ticker']})")
+        lines.append(f"  Short: <code>{p['short_strike']:.0f}</code>  ({p['short_ticker']})")
+        lines.append(f"  Entry: 9:45am ET")
+        if p.get("debit_dollars") is not None:
+            lines.append("")
+            lines.append(f"  Debit:     <b>${p['debit_dollars']:.2f}</b>")
+            lines.append(f"  Max gain:  <b>${p['max_gain_dollars']:.2f}</b>")
+            lines.append(f"  Max loss:  <b>${p['max_loss_dollars']:.2f}</b>")
+            lines.append(f"  Breakeven: <b>{p['breakeven']:.2f}</b>")
+            rr = p['max_gain_dollars'] / p['max_loss_dollars'] if p['max_loss_dollars'] else 0
+            lines.append(f"  R/R:       {rr:.2f}x")
+        if p.get("long_bid") is not None:
+            lines.append("")
+            lines.append(f"  Long  b/a: {p['long_bid']:.2f} / {p['long_ask']:.2f}")
+            lines.append(f"  Short b/a: {p['short_bid']:.2f} / {p['short_ask']:.2f}")
+        if p.get("long_iv"):
+            lines.append(f"  Long IV:   {p['long_iv']:.1%}")
+        if p.get("net_delta") is not None:
+            lines.append(f"  Net delta: {p['net_delta']:+.4f}")
+            lines.append(f"  Net theta: {p['net_theta']:+.4f}/day")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
     return "\n".join(lines)
 
 
