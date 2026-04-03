@@ -18,7 +18,7 @@ from typing import Optional
 import requests
 
 MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY")
-MASSIVE_BASE_URL = "https://api.massive.com"
+MASSIVE_BASE_URL = os.environ.get("MASSIVE_BASE_URL", "https://api.massive.com")
 
 # SPX option multiplier: each contract = $100 per index point
 SPX_MULTIPLIER = 100

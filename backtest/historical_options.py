@@ -33,8 +33,13 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_PATH = CACHE_DIR / "options_prices.parquet"
 
 MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY")
-MASSIVE_BASE_URL = "https://api.massive.com"
+# Allow overriding the base URL via .env (e.g. MASSIVE_BASE_URL=https://api.polygon.io)
+MASSIVE_BASE_URL = os.environ.get("MASSIVE_BASE_URL", "https://api.massive.com")
 SPX_MULTIPLIER = 100
+
+# Set to True at runtime if any SSL handshake failure is detected —
+# skips all further API calls and uses Black-Scholes for the whole run.
+_API_SSL_FAILED = False
 
 # Risk-free rate used for Black-Scholes (approximate; no large sensitivity for 0DTE)
 _BS_RISK_FREE = 0.05
@@ -52,6 +57,7 @@ def _headers() -> dict:
 
 
 def _get(path: str, params: dict = None, retries: int = 3) -> dict:
+    global _API_SSL_FAILED
     url = f"{MASSIVE_BASE_URL}{path}"
     param_str = "&".join(f"{k}={v}" for k, v in (params or {}).items())
     print(f"[API] GET {url}" + (f"?{param_str}" if param_str else ""))
@@ -73,16 +79,24 @@ def _get(path: str, params: dict = None, retries: int = 3) -> dict:
                     f"{resp.text[:200]}"
                 )
             data = resp.json()
-            # Print a compact summary of the response
             results = data.get("results")
             if isinstance(results, dict):
-                keys = list(results.keys())[:6]
-                print(f"[API]  → results keys: {keys}")
+                print(f"[API]  → results keys: {list(results.keys())[:6]}")
             elif isinstance(results, list):
                 print(f"[API]  → results count: {len(results)}")
             else:
                 print(f"[API]  → response keys: {list(data.keys())}")
             return data
+        except requests.exceptions.SSLError as exc:
+            # SSL handshake failures won't self-heal — disable API for the whole run
+            _API_SSL_FAILED = True
+            print(
+                f"[API]  → SSL HANDSHAKE FAILURE — disabling API for this run.\n"
+                f"         Check MASSIVE_BASE_URL in your .env "
+                f"(currently: {MASSIVE_BASE_URL})\n"
+                f"         Error: {exc}"
+            )
+            raise
         except requests.RequestException as exc:
             print(f"[API]  → RequestException (attempt {attempt+1}/{retries}): {exc}")
             if attempt == retries - 1:
@@ -203,6 +217,8 @@ def _fetch_snapshot_for_contract(
     The as_of date gives us the snapshot as it appeared on that trading day,
     which with the live feed's 15-min delay corresponds to the 9:45am view.
     """
+    if _API_SSL_FAILED:
+        return None  # already failed earlier — skip silently
     print(f"[snapshot] Fetching {occ_ticker}  as_of={trade_date}")
     try:
         data = _get(
@@ -220,7 +236,8 @@ def _fetch_snapshot_for_contract(
             print(f"[snapshot]   no results in response")
         return results or None
     except Exception as exc:
-        print(f"[snapshot]   FAILED: {exc}")
+        if not _API_SSL_FAILED:  # don't repeat SSL messages
+            print(f"[snapshot]   FAILED: {exc}")
         return None
 
 
@@ -262,7 +279,7 @@ def fetch_spread_pricing(
     )
 
     # ── Attempt 1: API snapshot with as_of ─────────────────────────────────────
-    if MASSIVE_API_KEY:
+    if MASSIVE_API_KEY and not _API_SSL_FAILED:
         long_ticker = _occ_ticker("SPX", trade_date, contract_type, long_strike)
         short_ticker = _occ_ticker("SPX", trade_date, contract_type, short_strike)
 
@@ -308,6 +325,8 @@ def fetch_spread_pricing(
             if not short_snap:
                 missing.append(short_ticker)
             print(f"[pricing]   ✗ API no snapshot for: {missing}")
+    elif _API_SSL_FAILED:
+        pass  # already printed one-time SSL warning, don't repeat
     else:
         print(f"[pricing]   skipping API (no MASSIVE_API_KEY)")
 
