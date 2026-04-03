@@ -7,6 +7,7 @@ Uses SPY intraday data from dbn parquets where available; falls back to daily OH
 """
 
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +15,7 @@ import pandas as pd
 import xgboost as xgb
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
 MODELS_DIR = PROJECT_ROOT / "models"
