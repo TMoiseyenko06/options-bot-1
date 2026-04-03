@@ -1,17 +1,18 @@
 """
 backtest/historical_options.py — Fetch and cache real historical SPX options pricing.
 
-Pricing strategy (in order of preference):
-  1. Massive API snapshot with as_of date — same endpoint family used in live
-     trading; fetches the snapshot as it appeared at market open on trade_date.
-     15-min delay is inherent: we request 9:30am data which is what the live
-     delayed feed shows at 9:45am entry time.
-  2. Black-Scholes with VIX — uses the VIX level already in the features
-     DataFrame as the annualized IV proxy.  Mathematically sound for 0DTE SPX.
-  3. 35% approximation — only if both above fail (no API key, no VIX data).
+Uses the official `massive` Python client (pip install massive) which handles
+TLS and authentication correctly against api.massive.com.
 
-Results are cached to data/cache/options_prices.parquet so the API is only
-called once per (date, contract_type, spread_width) combination.
+Pricing strategy (in order of preference):
+  1. /v3/quotes  — last bid/ask at or before 9:30am ET on trade_date.
+                   15-min delay: at 9:45am entry the live feed shows 9:30am data,
+                   so fetching 9:30am historical quotes gives identical pricing.
+  2. /v2/aggs 1-min bars — fallback when quotes unavailable; uses 9:30am bar close.
+  3. Black-Scholes with VIX — when API has no data for a date (e.g. very old contracts).
+  4. None returned → engine.py falls back to 35% approximation.
+
+Results cached to data/cache/options_prices.parquet.
 """
 
 import math
@@ -19,9 +20,9 @@ import os
 import time
 from datetime import date, datetime
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
-import requests
+import pytz
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -33,76 +34,28 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_PATH = CACHE_DIR / "options_prices.parquet"
 
 MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY")
-# Allow overriding the base URL via .env (e.g. MASSIVE_BASE_URL=https://api.polygon.io)
-MASSIVE_BASE_URL = os.environ.get("MASSIVE_BASE_URL", "https://api.massive.com")
 SPX_MULTIPLIER = 100
+ET_TZ = pytz.timezone("America/New_York")
 
-# Set to True at runtime if any SSL handshake failure is detected —
-# skips all further API calls and uses Black-Scholes for the whole run.
-_API_SSL_FAILED = False
+# 15-min delay: fetch quotes at 9:30am ET — what the live delayed feed shows at 9:45am
+_FETCH_HOUR = 9
+_FETCH_MINUTE = 30
 
-# Risk-free rate used for Black-Scholes (approximate; no large sensitivity for 0DTE)
+# Black-Scholes constants for 0DTE at 9:30am (T = 6.5 hrs until 4pm close)
+_T_0DTE = 6.5 / 8_760
 _BS_RISK_FREE = 0.05
 
-# 0DTE at 9:30am ET: 6.5 hours until 4pm close → fraction of calendar year
-_T_0DTE_930AM = 6.5 / 8_760
 
+# ── Massive client ─────────────────────────────────────────────────────────────
 
-# ── API helpers ────────────────────────────────────────────────────────────────
-
-def _headers() -> dict:
+def _client():
+    """Return an authenticated RESTClient. Raises clearly if key missing."""
     if not MASSIVE_API_KEY:
-        raise EnvironmentError("[historical_options] MASSIVE_API_KEY not set")
-    return {"Authorization": f"Bearer {MASSIVE_API_KEY}"}
-
-
-def _get(path: str, params: dict = None, retries: int = 3) -> dict:
-    global _API_SSL_FAILED
-    url = f"{MASSIVE_BASE_URL}{path}"
-    param_str = "&".join(f"{k}={v}" for k, v in (params or {}).items())
-    print(f"[API] GET {url}" + (f"?{param_str}" if param_str else ""))
-    for attempt in range(retries):
-        try:
-            resp = requests.get(
-                url, headers=_headers(), params=params or {}, timeout=15
-            )
-            print(f"[API]  → {resp.status_code}  ({len(resp.content)} bytes)")
-            if resp.status_code == 429:
-                wait = 2 ** attempt
-                print(f"[API]  → rate limited, waiting {wait}s …")
-                time.sleep(wait)
-                continue
-            if resp.status_code != 200:
-                print(f"[API]  → body: {resp.text[:400]}")
-                raise RuntimeError(
-                    f"[historical_options] API {resp.status_code} on {path}: "
-                    f"{resp.text[:200]}"
-                )
-            data = resp.json()
-            results = data.get("results")
-            if isinstance(results, dict):
-                print(f"[API]  → results keys: {list(results.keys())[:6]}")
-            elif isinstance(results, list):
-                print(f"[API]  → results count: {len(results)}")
-            else:
-                print(f"[API]  → response keys: {list(data.keys())}")
-            return data
-        except requests.exceptions.SSLError as exc:
-            # SSL handshake failures won't self-heal — disable API for the whole run
-            _API_SSL_FAILED = True
-            print(
-                f"[API]  → SSL HANDSHAKE FAILURE — disabling API for this run.\n"
-                f"         Check MASSIVE_BASE_URL in your .env "
-                f"(currently: {MASSIVE_BASE_URL})\n"
-                f"         Error: {exc}"
-            )
-            raise
-        except requests.RequestException as exc:
-            print(f"[API]  → RequestException (attempt {attempt+1}/{retries}): {exc}")
-            if attempt == retries - 1:
-                raise
-            time.sleep(1 + attempt)
-    raise RuntimeError(f"[historical_options] All retries exhausted for {path}")
+        raise EnvironmentError(
+            "[historical_options] MASSIVE_API_KEY not set in .env"
+        )
+    from massive import RESTClient
+    return RESTClient(api_key=MASSIVE_API_KEY)
 
 
 # ── OCC ticker ─────────────────────────────────────────────────────────────────
@@ -120,10 +73,7 @@ def _occ_ticker(underlying: str, expiry: date, contract_type: str, strike: float
 def _atm_strikes(
     contract_type: str, spx_price: float, spread_width: int
 ) -> tuple[float, float]:
-    """
-    Round spx_price to nearest 5-point increment for first OTM strike.
-    Mirrors dashboard/massive.py for consistency.
-    """
+    """First OTM strike rounded to nearest 5-pt increment. Matches dashboard/massive.py."""
     if contract_type == "call":
         long_strike = round(spx_price / 5) * 5
         if long_strike <= spx_price:
@@ -133,8 +83,7 @@ def _atm_strikes(
         if long_strike >= spx_price:
             long_strike -= 5
     short_strike = (
-        long_strike + spread_width
-        if contract_type == "call"
+        long_strike + spread_width if contract_type == "call"
         else long_strike - spread_width
     )
     return float(long_strike), float(short_strike)
@@ -146,10 +95,7 @@ def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def _bs_option_price(
-    contract_type: str, S: float, K: float, T: float, r: float, sigma: float
-) -> float:
-    """European option price via Black-Scholes."""
+def _bs_price(contract_type: str, S: float, K: float, T: float, r: float, sigma: float) -> float:
     if T <= 0:
         return max(S - K, 0.0) if contract_type == "call" else max(K - S, 0.0)
     sqrt_T = math.sqrt(T)
@@ -157,98 +103,111 @@ def _bs_option_price(
     d2 = d1 - sigma * sqrt_T
     if contract_type == "call":
         return S * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
-    else:
-        return K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
+    return K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
 
 
-def _bs_spread_pricing(
-    contract_type: str,
-    spx_price: float,
-    long_strike: float,
-    short_strike: float,
-    vix: float,
+def _bs_spread(
+    contract_type: str, spx: float, k_long: float, k_short: float, vix: float
 ) -> Optional[dict]:
-    """
-    Black-Scholes spread pricing for 0DTE at 9:30am ET.
-    VIX is used as the annualized IV proxy (standard market practice).
-    T = 6.5 hrs (9:30am → 4pm close) as fraction of calendar year.
-    """
     sigma = vix / 100.0
-    if sigma <= 0 or spx_price <= 0:
+    long_p = _bs_price(contract_type, spx, k_long, _T_0DTE, _BS_RISK_FREE, sigma)
+    short_p = _bs_price(contract_type, spx, k_short, _T_0DTE, _BS_RISK_FREE, sigma)
+    debit_ps = long_p - short_p
+    if debit_ps <= 0:
         return None
-
-    long_price = _bs_option_price(
-        contract_type, spx_price, long_strike, _T_0DTE_930AM, _BS_RISK_FREE, sigma
-    )
-    short_price = _bs_option_price(
-        contract_type, spx_price, short_strike, _T_0DTE_930AM, _BS_RISK_FREE, sigma
-    )
-
-    debit_per_share = long_price - short_price
-    if debit_per_share <= 0:
+    debit_d = debit_ps * SPX_MULTIPLIER
+    max_gain_d = abs(k_long - k_short) * SPX_MULTIPLIER - debit_d
+    if max_gain_d <= 0:
         return None
-
-    debit_dollars = debit_per_share * SPX_MULTIPLIER
-    spread_width = abs(long_strike - short_strike)
-    max_value_dollars = spread_width * SPX_MULTIPLIER
-    max_gain_dollars = max_value_dollars - debit_dollars
-
-    if max_gain_dollars <= 0:
-        return None
-
     return {
-        "debit_dollars": round(debit_dollars, 2),
-        "max_gain_dollars": round(max_gain_dollars, 2),
-        "debit_per_share": round(debit_per_share, 4),
-        "long_strike": long_strike,
-        "short_strike": short_strike,
+        "debit_dollars": round(debit_d, 2),
+        "max_gain_dollars": round(max_gain_d, 2),
+        "debit_per_share": round(debit_ps, 4),
         "source": "black_scholes_vix",
     }
 
 
-# ── Massive API snapshot (historical) ─────────────────────────────────────────
+# ── Quote fetch (primary) ──────────────────────────────────────────────────────
 
-def _fetch_snapshot_for_contract(
-    underlying: str, occ_ticker: str, trade_date: date
-) -> Optional[dict]:
+def _fetch_quote_at_930(
+    client, occ_ticker: str, trade_date: date
+) -> Optional[tuple[float, float]]:
     """
-    Fetch a single-contract snapshot with as_of date.
-    Uses the same /v3/snapshot/options endpoint as live trading.
-    The as_of date gives us the snapshot as it appeared on that trading day,
-    which with the live feed's 15-min delay corresponds to the 9:45am view.
+    Fetch the last bid/ask at or before 9:30am ET via /v3/quotes.
+    Returns (bid, ask) or None.
     """
-    if _API_SSL_FAILED:
-        return None  # already failed earlier — skip silently
-    print(f"[snapshot] Fetching {occ_ticker}  as_of={trade_date}")
+    dt_et = ET_TZ.localize(
+        datetime(trade_date.year, trade_date.month, trade_date.day,
+                 _FETCH_HOUR, _FETCH_MINUTE, 0)
+    )
+    print(f"[quotes] {occ_ticker}  timestamp_lte={dt_et.isoformat()}")
     try:
-        data = _get(
-            f"/v3/snapshot/options/{underlying}/{occ_ticker}",
-            {"as_of": trade_date.isoformat()},
-        )
-        results = data.get("results", {})
-        if results:
-            quote = results.get("last_quote", {})
-            print(
-                f"[snapshot]   bid={quote.get('bid')}  ask={quote.get('ask')}  "
-                f"mid={quote.get('midpoint')}  iv={results.get('implied_volatility')}"
+        quotes = list(
+            client.list_quotes(
+                occ_ticker,
+                timestamp_lte=dt_et,
+                limit=1,
+                order="desc",
+                sort="timestamp",
             )
-        else:
-            print(f"[snapshot]   no results in response")
-        return results or None
+        )
+        if not quotes:
+            print(f"[quotes]   no results")
+            return None
+        q = quotes[0]
+        bid = q.bid_price
+        ask = q.ask_price
+        print(f"[quotes]   bid={bid}  ask={ask}  sip_ts={q.sip_timestamp}")
+        if bid is None or ask is None:
+            print(f"[quotes]   bid or ask is None — skipping")
+            return None
+        return float(bid), float(ask)
     except Exception as exc:
-        if not _API_SSL_FAILED:  # don't repeat SSL messages
-            print(f"[snapshot]   FAILED: {exc}")
+        print(f"[quotes]   FAILED: {exc}")
         return None
 
 
-def _extract_bid_ask(snapshot: dict) -> tuple[Optional[float], Optional[float]]:
-    """Extract bid and ask from a snapshot result."""
-    quote = snapshot.get("last_quote", {})
-    bid = quote.get("bid")
-    ask = quote.get("ask")
-    mid = quote.get("midpoint")
-    # Use midpoint as fallback for either side
-    return (bid or mid), (ask or mid)
+# ── Agg bar fetch (fallback) ───────────────────────────────────────────────────
+
+def _fetch_agg_at_930(
+    client, occ_ticker: str, trade_date: date
+) -> Optional[float]:
+    """
+    Fallback: fetch 1-min OHLCV bars and return the close of the first bar
+    at or after 9:30am ET. Used as a mid-price proxy when no quote is available.
+    """
+    date_str = trade_date.isoformat()
+    print(f"[aggs]   {occ_ticker}  {date_str}")
+    try:
+        aggs = client.get_aggs(
+            occ_ticker,
+            multiplier=1,
+            timespan="minute",
+            from_=date_str,
+            to=date_str,
+            adjusted=False,
+            sort="asc",
+            limit=50,
+        )
+        if not aggs:
+            print(f"[aggs]   no bars returned")
+            return None
+        for bar in aggs:
+            ts_ms = bar.timestamp
+            dt_et = (
+                pytz.utc.localize(datetime.utcfromtimestamp(ts_ms / 1000))
+                .astimezone(ET_TZ)
+            )
+            if dt_et.hour > _FETCH_HOUR or (
+                dt_et.hour == _FETCH_HOUR and dt_et.minute >= _FETCH_MINUTE
+            ):
+                print(f"[aggs]   bar at {dt_et.strftime('%H:%M')} ET  close={bar.close}")
+                return float(bar.close)
+        print(f"[aggs]   no bar at or after 09:30 ET")
+        return None
+    except Exception as exc:
+        print(f"[aggs]   FAILED: {exc}")
+        return None
 
 
 # ── Main pricing function ──────────────────────────────────────────────────────
@@ -261,97 +220,102 @@ def fetch_spread_pricing(
     vix: Optional[float] = None,
 ) -> Optional[dict]:
     """
-    Fetch real spread pricing for a 0DTE trade on trade_date.
+    Fetch real spread pricing for a 0DTE entry on trade_date.
 
-    Order of attempts:
-      1. Massive API snapshot with as_of=trade_date (real market data, 15-min delay)
-      2. Black-Scholes with VIX (if vix is provided)
-      3. Returns None → caller uses 35% approximation
-
-    15-min delay note: the snapshot as_of endpoint returns data as it appeared
-    at market open, matching what the live 15-min delayed feed shows at 9:45am.
+    Attempts in order:
+      1. /v3/quotes at 9:30am ET (real bid/ask, 15-min delayed equivalent)
+      2. /v2/aggs 1-min bar close at 9:30am ET
+      3. Black-Scholes with VIX
+      4. Returns None → caller uses 35% fallback
     """
-    long_strike, short_strike = _atm_strikes(contract_type, spx_price, spread_width)
+    k_long, k_short = _atm_strikes(contract_type, spx_price, spread_width)
+    long_ticker = _occ_ticker("SPX", trade_date, contract_type, k_long)
+    short_ticker = _occ_ticker("SPX", trade_date, contract_type, k_short)
+
     print(
         f"\n[pricing] {trade_date}  {contract_type.upper()}  {spread_width}pt  "
-        f"SPX={spx_price:.1f}  VIX={vix}  "
-        f"strikes={long_strike}/{short_strike}"
+        f"SPX={spx_price:.1f}  VIX={vix}  strikes={k_long}/{k_short}"
     )
+    print(f"[pricing]   long  → {long_ticker}")
+    print(f"[pricing]   short → {short_ticker}")
 
-    # ── Attempt 1: API snapshot with as_of ─────────────────────────────────────
-    if MASSIVE_API_KEY and not _API_SSL_FAILED:
-        long_ticker = _occ_ticker("SPX", trade_date, contract_type, long_strike)
-        short_ticker = _occ_ticker("SPX", trade_date, contract_type, short_strike)
+    if MASSIVE_API_KEY:
+        c = _client()
 
-        long_snap = _fetch_snapshot_for_contract("SPX", long_ticker, trade_date)
-        short_snap = _fetch_snapshot_for_contract("SPX", short_ticker, trade_date)
+        # ── Attempt 1: /v3/quotes ──────────────────────────────────────────────
+        long_quote = _fetch_quote_at_930(c, long_ticker, trade_date)
+        short_quote = _fetch_quote_at_930(c, short_ticker, trade_date)
 
-        if long_snap and short_snap:
-            _, long_ask = _extract_bid_ask(long_snap)
-            short_bid, _ = _extract_bid_ask(short_snap)
-            print(
-                f"[pricing]   API quotes — long_ask={long_ask}  short_bid={short_bid}"
-            )
-
-            if long_ask is not None and short_bid is not None:
-                debit_per_share = float(long_ask) - float(short_bid)
-                print(f"[pricing]   debit_per_share={debit_per_share:.4f}")
-                if debit_per_share > 0:
-                    debit_dollars = debit_per_share * SPX_MULTIPLIER
-                    max_gain_dollars = spread_width * SPX_MULTIPLIER - debit_dollars
-                    if max_gain_dollars > 0:
-                        print(
-                            f"[pricing]   ✓ API  debit=${debit_dollars:.2f}  "
-                            f"max_gain=${max_gain_dollars:.2f}"
-                        )
-                        return {
-                            "debit_dollars": round(debit_dollars, 2),
-                            "max_gain_dollars": round(max_gain_dollars, 2),
-                            "debit_per_share": round(debit_per_share, 4),
-                            "long_strike": long_strike,
-                            "short_strike": short_strike,
-                            "source": "api_snapshot",
-                        }
-                    else:
-                        print(f"[pricing]   ✗ API max_gain<=0, skipping")
-                else:
-                    print(f"[pricing]   ✗ API debit<=0, skipping")
+        if long_quote and short_quote:
+            long_ask = long_quote[1]    # (bid, ask)
+            short_bid = short_quote[0]
+            print(f"[pricing]   quotes — long_ask={long_ask}  short_bid={short_bid}")
+            debit_ps = long_ask - short_bid
+            if debit_ps > 0:
+                debit_d = debit_ps * SPX_MULTIPLIER
+                max_gain_d = spread_width * SPX_MULTIPLIER - debit_d
+                if max_gain_d > 0:
+                    print(f"[pricing]   ✓ quotes  debit=${debit_d:.2f}  max_gain=${max_gain_d:.2f}")
+                    return {
+                        "debit_dollars": round(debit_d, 2),
+                        "max_gain_dollars": round(max_gain_d, 2),
+                        "debit_per_share": round(debit_ps, 4),
+                        "long_strike": k_long,
+                        "short_strike": k_short,
+                        "source": "api_quotes",
+                    }
+                print(f"[pricing]   ✗ quotes max_gain<=0")
             else:
-                print(f"[pricing]   ✗ API bid/ask missing from snapshot")
+                print(f"[pricing]   ✗ quotes debit<=0 (long_ask={long_ask} short_bid={short_bid})")
         else:
-            missing = []
-            if not long_snap:
-                missing.append(long_ticker)
-            if not short_snap:
-                missing.append(short_ticker)
-            print(f"[pricing]   ✗ API no snapshot for: {missing}")
-    elif _API_SSL_FAILED:
-        pass  # already printed one-time SSL warning, don't repeat
-    else:
-        print(f"[pricing]   skipping API (no MASSIVE_API_KEY)")
+            print(f"[pricing]   quotes incomplete — trying agg bars")
 
-    # ── Attempt 2: Black-Scholes with VIX ──────────────────────────────────────
+        # ── Attempt 2: /v2/aggs 1-min bars ────────────────────────────────────
+        long_close = _fetch_agg_at_930(c, long_ticker, trade_date)
+        short_close = _fetch_agg_at_930(c, short_ticker, trade_date)
+        print(f"[pricing]   aggs — long_close={long_close}  short_close={short_close}")
+
+        if long_close is not None and short_close is not None:
+            debit_ps = long_close - short_close
+            if debit_ps > 0:
+                debit_d = debit_ps * SPX_MULTIPLIER
+                max_gain_d = spread_width * SPX_MULTIPLIER - debit_d
+                if max_gain_d > 0:
+                    print(f"[pricing]   ✓ aggs   debit=${debit_d:.2f}  max_gain=${max_gain_d:.2f}")
+                    return {
+                        "debit_dollars": round(debit_d, 2),
+                        "max_gain_dollars": round(max_gain_d, 2),
+                        "debit_per_share": round(debit_ps, 4),
+                        "long_strike": k_long,
+                        "short_strike": k_short,
+                        "source": "api_aggs",
+                    }
+                print(f"[pricing]   ✗ aggs max_gain<=0")
+            else:
+                print(f"[pricing]   ✗ aggs debit<=0")
+    else:
+        print(f"[pricing]   no MASSIVE_API_KEY — skipping API")
+
+    # ── Attempt 3: Black-Scholes with VIX ─────────────────────────────────────
     if vix is not None and vix > 0:
         print(
-            f"[pricing]   trying Black-Scholes  VIX={vix:.2f}  "
-            f"sigma={vix/100:.3f}  T={_T_0DTE_930AM:.6f}"
+            f"[pricing]   trying Black-Scholes  VIX={vix:.2f}  sigma={vix/100:.3f}  "
+            f"T={_T_0DTE:.6f}"
         )
-        result = _bs_spread_pricing(
-            contract_type, spx_price, long_strike, short_strike, vix
-        )
+        result = _bs_spread(contract_type, spx_price, k_long, k_short, vix)
         if result is not None:
+            result.update({"long_strike": k_long, "short_strike": k_short})
             print(
-                f"[pricing]   ✓ BS   debit=${result['debit_dollars']:.2f}  "
+                f"[pricing]   ✓ BS    debit=${result['debit_dollars']:.2f}  "
                 f"max_gain=${result['max_gain_dollars']:.2f}"
             )
             return result
-        else:
-            print(f"[pricing]   ✗ BS returned None (debit<=0 or max_gain<=0)")
+        print(f"[pricing]   ✗ BS returned None")
     else:
         print(f"[pricing]   skipping BS (vix={vix})")
 
     print(f"[pricing]   → FALLBACK to 35% approximation")
-    return None  # caller falls back to 35%
+    return None
 
 
 # ── Cache build ────────────────────────────────────────────────────────────────
@@ -359,88 +323,70 @@ def fetch_spread_pricing(
 def _build_cache(
     df: pd.DataFrame,
     spread_widths: list[int],
-    api_delay_seconds: float = 0.2,
+    api_delay_seconds: float = 0.15,
 ) -> pd.DataFrame:
-    """
-    Fetch pricing for every (date, contract_type, spread_width) in df.
-    Uses spy_close × 10 as SPX price approximation and vix_level for BS fallback.
-    """
-    spy_col = next(
-        (c for c in df.columns if c in ("spy_close", "spy_adj_close")), None
-    )
-    vix_col = next(
-        (c for c in df.columns if c in ("vix_level", "vix_close", "vix_vix_close")), None
-    )
+    spy_col = next((c for c in df.columns if c in ("spy_close", "spy_adj_close")), None)
+    vix_col = next((c for c in df.columns if c in ("vix_level", "vix_close", "vix_vix_close")), None)
     if spy_col is None:
-        print("[historical_options] No spy_close column — cannot build options cache")
+        print("[historical_options] No spy_close column — cannot build cache")
         return pd.DataFrame()
 
     dates = sorted(df["date"].dt.date.unique())
     total = len(dates) * len(spread_widths) * 2
-    done = 0
-    api_hits = bs_hits = fallback_hits = 0
+    done = api_q = api_a = bs = fb = 0
     rows = []
 
     print(
         f"[historical_options] Building options cache: "
-        f"{len(dates)} dates × {len(spread_widths)} widths × 2 directions "
-        f"= {total} slots"
+        f"{len(dates)} dates × {len(spread_widths)} widths × 2 directions = {total} slots"
     )
-    if not MASSIVE_API_KEY:
-        print("[historical_options] No MASSIVE_API_KEY — using Black-Scholes only")
 
     for trade_date in dates:
-        date_row = df[df["date"].dt.date == trade_date].iloc[0]
-        spx_price = float(date_row[spy_col]) * 10
-        vix = float(date_row[vix_col]) if vix_col and pd.notna(date_row[vix_col]) else None
+        row = df[df["date"].dt.date == trade_date].iloc[0]
+        spx = float(row[spy_col]) * 10
+        vix = float(row[vix_col]) if vix_col and pd.notna(row[vix_col]) else None
 
         for spread_width in spread_widths:
             for contract_type in ("call", "put"):
                 done += 1
                 print(
                     f"\n[build_cache] ── slot {done}/{total}  "
-                    f"date={trade_date}  {contract_type}  {spread_width}pt  "
-                    f"SPX≈{spx_price:.1f}  VIX={vix}"
+                    f"{trade_date}  {contract_type}  {spread_width}pt  "
+                    f"SPX≈{spx:.1f}  VIX={vix}"
                 )
+                result = fetch_spread_pricing(trade_date, contract_type, spx, spread_width, vix)
 
-                result = fetch_spread_pricing(
-                    trade_date, contract_type, spx_price, spread_width, vix
-                )
-
-                if result is not None:
+                if result:
                     src = result["source"]
-                    if src == "api_snapshot":
-                        api_hits += 1
-                    else:
-                        bs_hits += 1
+                    if src == "api_quotes": api_q += 1
+                    elif src == "api_aggs": api_a += 1
+                    else: bs += 1
                     print(
-                        f"[build_cache]   RESULT source={src}  "
+                        f"[build_cache]   RESULT  source={src}  "
                         f"debit=${result['debit_dollars']:.2f}  "
                         f"max_gain=${result['max_gain_dollars']:.2f}"
                     )
-                    rows.append(
-                        {
-                            "date": str(trade_date),
-                            "contract_type": contract_type,
-                            "spread_width": spread_width,
-                            "debit_dollars": result["debit_dollars"],
-                            "max_gain_dollars": result["max_gain_dollars"],
-                            "debit_per_share": result["debit_per_share"],
-                            "long_strike": result["long_strike"],
-                            "short_strike": result["short_strike"],
-                            "source": result["source"],
-                        }
-                    )
+                    rows.append({
+                        "date": str(trade_date),
+                        "contract_type": contract_type,
+                        "spread_width": spread_width,
+                        "debit_dollars": result["debit_dollars"],
+                        "max_gain_dollars": result["max_gain_dollars"],
+                        "debit_per_share": result["debit_per_share"],
+                        "long_strike": result["long_strike"],
+                        "short_strike": result["short_strike"],
+                        "source": src,
+                    })
                 else:
-                    fallback_hits += 1
-                    print(f"[build_cache]   RESULT source=35pct_fallback")
+                    fb += 1
+                    print(f"[build_cache]   RESULT  source=35pct_fallback")
 
                 if MASSIVE_API_KEY:
                     time.sleep(api_delay_seconds)
 
     print(
-        f"[historical_options] Done: api_snapshot={api_hits}  "
-        f"black_scholes={bs_hits}  35pct_fallback={fallback_hits}"
+        f"\n[historical_options] Cache complete: "
+        f"api_quotes={api_q}  api_aggs={api_a}  black_scholes={bs}  35pct_fallback={fb}"
     )
     return pd.DataFrame(rows)
 
@@ -453,32 +399,23 @@ def load_options_cache(
     force_refresh: bool = False,
 ) -> dict:
     """
-    Load the on-disk options pricing cache, fetching any missing dates.
-
-    Returns lookup dict keyed by (date_str, contract_type, spread_width):
-        {("2023-01-10", "call", 3): {"debit_dollars": 112.5, "max_gain_dollars": 187.5}, ...}
-
-    Trades whose key is absent fall back to the 35% approximation in engine.py.
+    Load or build the options pricing cache.
+    Returns lookup dict keyed by (date_str, contract_type, spread_width).
+    Missing keys fall back to 35% approximation in engine.py.
     """
     cache_df = pd.DataFrame()
 
     if CACHE_PATH.exists() and not force_refresh:
         cache_df = pd.read_parquet(CACHE_PATH)
-        print(
-            f"[historical_options] Loaded cache: {len(cache_df)} rows "
-            f"from {CACHE_PATH}"
-        )
+        print(f"[historical_options] Loaded cache: {len(cache_df)} rows from {CACHE_PATH}")
 
-    # Determine which (date, width, direction) combos are missing
     needed_dates = {str(d) for d in df["date"].dt.date.unique()}
     if not cache_df.empty:
-        cached_keys = set(
-            zip(
-                cache_df["date"].astype(str),
-                cache_df["contract_type"],
-                cache_df["spread_width"].astype(int),
-            )
-        )
+        cached_keys = set(zip(
+            cache_df["date"].astype(str),
+            cache_df["contract_type"],
+            cache_df["spread_width"].astype(int),
+        ))
         missing_dates = {
             d for d in needed_dates
             for w in spread_widths
@@ -494,16 +431,10 @@ def load_options_cache(
         new_data = _build_cache(missing_df, spread_widths)
         if not new_data.empty:
             cache_df = pd.concat([cache_df, new_data], ignore_index=True)
-            cache_df = cache_df.drop_duplicates(
-                subset=["date", "contract_type", "spread_width"]
-            )
+            cache_df = cache_df.drop_duplicates(subset=["date", "contract_type", "spread_width"])
             cache_df.to_parquet(CACHE_PATH, index=False)
-            print(
-                f"[historical_options] Cache saved → {CACHE_PATH} "
-                f"({len(cache_df)} rows)"
-            )
+            print(f"[historical_options] Cache saved → {CACHE_PATH} ({len(cache_df)} rows)")
 
-    # Build O(1) lookup dict
     lookup: dict = {}
     for _, row in cache_df.iterrows():
         key = (str(row["date"]), str(row["contract_type"]), int(row["spread_width"]))
