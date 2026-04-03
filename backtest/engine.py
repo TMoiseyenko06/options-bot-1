@@ -305,6 +305,19 @@ def run_backtest(
                 trade_debit = cached["debit_dollars"]
                 trade_max_gain = cached["max_gain_dollars"]
                 pricing_source = "api_real"
+            else:
+                print(
+                    f"[backtest] {trade_date.date()} {contract_type}: "
+                    f"no cache entry → 35% fallback  "
+                    f"(key={cache_key})"
+                )
+
+        print(
+            f"[trade] {trade_date.date()}  {contract_type.upper():4s}  "
+            f"source={pricing_source}  "
+            f"debit=${trade_debit:.2f}  max_gain=${trade_max_gain:.2f}  "
+            f"conf={proba[i][pred_class]:.3f}"
+        )
 
         day_bars = intraday_by_date.get(trade_date)
 
@@ -339,6 +352,11 @@ def run_backtest(
 
         confidence = float(proba[i][pred_class])
         spread_type = "call_spread" if pred_direction == 1 else "put_spread"
+
+        print(
+            f"[trade]   → exit={exit_type}  pnl=${pnl:.2f}  "
+            f"hold={hold_hours:.1f}h  {'WIN' if pnl > 0 else 'LOSS'}"
+        )
 
         trades.append({
             "date": row["date"],

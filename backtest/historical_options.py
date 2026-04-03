@@ -53,23 +53,38 @@ def _headers() -> dict:
 
 def _get(path: str, params: dict = None, retries: int = 3) -> dict:
     url = f"{MASSIVE_BASE_URL}{path}"
+    param_str = "&".join(f"{k}={v}" for k, v in (params or {}).items())
+    print(f"[API] GET {url}" + (f"?{param_str}" if param_str else ""))
     for attempt in range(retries):
         try:
             resp = requests.get(
                 url, headers=_headers(), params=params or {}, timeout=15
             )
+            print(f"[API]  → {resp.status_code}  ({len(resp.content)} bytes)")
             if resp.status_code == 429:
                 wait = 2 ** attempt
-                print(f"[historical_options]   Rate limited, waiting {wait}s …")
+                print(f"[API]  → rate limited, waiting {wait}s …")
                 time.sleep(wait)
                 continue
             if resp.status_code != 200:
+                print(f"[API]  → body: {resp.text[:400]}")
                 raise RuntimeError(
                     f"[historical_options] API {resp.status_code} on {path}: "
                     f"{resp.text[:200]}"
                 )
-            return resp.json()
+            data = resp.json()
+            # Print a compact summary of the response
+            results = data.get("results")
+            if isinstance(results, dict):
+                keys = list(results.keys())[:6]
+                print(f"[API]  → results keys: {keys}")
+            elif isinstance(results, list):
+                print(f"[API]  → results count: {len(results)}")
+            else:
+                print(f"[API]  → response keys: {list(data.keys())}")
+            return data
         except requests.RequestException as exc:
+            print(f"[API]  → RequestException (attempt {attempt+1}/{retries}): {exc}")
             if attempt == retries - 1:
                 raise
             time.sleep(1 + attempt)
@@ -188,17 +203,24 @@ def _fetch_snapshot_for_contract(
     The as_of date gives us the snapshot as it appeared on that trading day,
     which with the live feed's 15-min delay corresponds to the 9:45am view.
     """
+    print(f"[snapshot] Fetching {occ_ticker}  as_of={trade_date}")
     try:
         data = _get(
             f"/v3/snapshot/options/{underlying}/{occ_ticker}",
             {"as_of": trade_date.isoformat()},
         )
-        return data.get("results", {}) or None
+        results = data.get("results", {})
+        if results:
+            quote = results.get("last_quote", {})
+            print(
+                f"[snapshot]   bid={quote.get('bid')}  ask={quote.get('ask')}  "
+                f"mid={quote.get('midpoint')}  iv={results.get('implied_volatility')}"
+            )
+        else:
+            print(f"[snapshot]   no results in response")
+        return results or None
     except Exception as exc:
-        # Only print non-SSL errors as warnings; SSL means endpoint not supported
-        msg = str(exc)
-        if "SSL" not in msg and "ssl" not in msg:
-            print(f"[historical_options]   Snapshot fetch failed for {occ_ticker}: {exc}")
+        print(f"[snapshot]   FAILED: {exc}")
         return None
 
 
@@ -233,6 +255,11 @@ def fetch_spread_pricing(
     at market open, matching what the live 15-min delayed feed shows at 9:45am.
     """
     long_strike, short_strike = _atm_strikes(contract_type, spx_price, spread_width)
+    print(
+        f"\n[pricing] {trade_date}  {contract_type.upper()}  {spread_width}pt  "
+        f"SPX={spx_price:.1f}  VIX={vix}  "
+        f"strikes={long_strike}/{short_strike}"
+    )
 
     # ── Attempt 1: API snapshot with as_of ─────────────────────────────────────
     if MASSIVE_API_KEY:
@@ -245,13 +272,21 @@ def fetch_spread_pricing(
         if long_snap and short_snap:
             _, long_ask = _extract_bid_ask(long_snap)
             short_bid, _ = _extract_bid_ask(short_snap)
+            print(
+                f"[pricing]   API quotes — long_ask={long_ask}  short_bid={short_bid}"
+            )
 
             if long_ask is not None and short_bid is not None:
                 debit_per_share = float(long_ask) - float(short_bid)
+                print(f"[pricing]   debit_per_share={debit_per_share:.4f}")
                 if debit_per_share > 0:
                     debit_dollars = debit_per_share * SPX_MULTIPLIER
                     max_gain_dollars = spread_width * SPX_MULTIPLIER - debit_dollars
                     if max_gain_dollars > 0:
+                        print(
+                            f"[pricing]   ✓ API  debit=${debit_dollars:.2f}  "
+                            f"max_gain=${max_gain_dollars:.2f}"
+                        )
                         return {
                             "debit_dollars": round(debit_dollars, 2),
                             "max_gain_dollars": round(max_gain_dollars, 2),
@@ -260,15 +295,43 @@ def fetch_spread_pricing(
                             "short_strike": short_strike,
                             "source": "api_snapshot",
                         }
+                    else:
+                        print(f"[pricing]   ✗ API max_gain<=0, skipping")
+                else:
+                    print(f"[pricing]   ✗ API debit<=0, skipping")
+            else:
+                print(f"[pricing]   ✗ API bid/ask missing from snapshot")
+        else:
+            missing = []
+            if not long_snap:
+                missing.append(long_ticker)
+            if not short_snap:
+                missing.append(short_ticker)
+            print(f"[pricing]   ✗ API no snapshot for: {missing}")
+    else:
+        print(f"[pricing]   skipping API (no MASSIVE_API_KEY)")
 
     # ── Attempt 2: Black-Scholes with VIX ──────────────────────────────────────
     if vix is not None and vix > 0:
+        print(
+            f"[pricing]   trying Black-Scholes  VIX={vix:.2f}  "
+            f"sigma={vix/100:.3f}  T={_T_0DTE_930AM:.6f}"
+        )
         result = _bs_spread_pricing(
             contract_type, spx_price, long_strike, short_strike, vix
         )
         if result is not None:
+            print(
+                f"[pricing]   ✓ BS   debit=${result['debit_dollars']:.2f}  "
+                f"max_gain=${result['max_gain_dollars']:.2f}"
+            )
             return result
+        else:
+            print(f"[pricing]   ✗ BS returned None (debit<=0 or max_gain<=0)")
+    else:
+        print(f"[pricing]   skipping BS (vix={vix})")
 
+    print(f"[pricing]   → FALLBACK to 35% approximation")
     return None  # caller falls back to 35%
 
 
@@ -315,21 +378,27 @@ def _build_cache(
         for spread_width in spread_widths:
             for contract_type in ("call", "put"):
                 done += 1
-                if done % 50 == 0 or done == total:
-                    print(
-                        f"[historical_options]   {done}/{total}  "
-                        f"(api={api_hits} bs={bs_hits} fallback={fallback_hits})"
-                    )
+                print(
+                    f"\n[build_cache] ── slot {done}/{total}  "
+                    f"date={trade_date}  {contract_type}  {spread_width}pt  "
+                    f"SPX≈{spx_price:.1f}  VIX={vix}"
+                )
 
                 result = fetch_spread_pricing(
                     trade_date, contract_type, spx_price, spread_width, vix
                 )
 
                 if result is not None:
-                    if result["source"] == "api_snapshot":
+                    src = result["source"]
+                    if src == "api_snapshot":
                         api_hits += 1
                     else:
                         bs_hits += 1
+                    print(
+                        f"[build_cache]   RESULT source={src}  "
+                        f"debit=${result['debit_dollars']:.2f}  "
+                        f"max_gain=${result['max_gain_dollars']:.2f}"
+                    )
                     rows.append(
                         {
                             "date": str(trade_date),
@@ -345,6 +414,7 @@ def _build_cache(
                     )
                 else:
                     fallback_hits += 1
+                    print(f"[build_cache]   RESULT source=35pct_fallback")
 
                 if MASSIVE_API_KEY:
                     time.sleep(api_delay_seconds)
