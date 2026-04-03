@@ -54,6 +54,7 @@ def _run_single_combo(
     model: xgb.XGBClassifier,
     feature_cols: list,
     intraday_df,
+    options_pricing: dict | None = None,
 ) -> dict | None:
     """Run one parameter combination and return the result row, or None on error."""
     debit, max_gain = _params_to_debit_and_gain(int(params["spread_width"]))
@@ -70,6 +71,7 @@ def _run_single_combo(
             direction_threshold=params["direction_threshold"],
             vix_filter=params["vix_filter"],
             intraday_df=intraday_df,
+            options_pricing=options_pricing,
         )
         if "error" in summary:
             return None
@@ -95,6 +97,7 @@ def run_sweep(
     model: xgb.XGBClassifier,
     feature_cols: list[str],
     intraday_df=None,
+    options_pricing: dict | None = None,
     n_workers: int | None = None,
 ):
     keys = list(SWEEP_PARAMS.keys())
@@ -110,7 +113,10 @@ def run_sweep(
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(_run_single_combo, params, df, model, feature_cols, intraday_df): params
+            executor.submit(
+                _run_single_combo, params, df, model, feature_cols,
+                intraday_df, options_pricing,
+            ): params
             for params in combos
         }
         for future in as_completed(futures):
@@ -248,7 +254,17 @@ def main():
     else:
         print("  No intraday data — using daily fallback")
 
-    results_df = run_sweep(df, model, feature_cols, intraday_df=intraday_df, n_workers=args.workers)
+    # Load real options pricing from Massive API (15-min delayed, consistent with live)
+    # Pre-fetch all spread widths swept so each combo can use actual debit/max_gain.
+    from backtest.historical_options import load_options_cache
+    options_pricing = load_options_cache(df, spread_widths=list(SWEEP_PARAMS["spread_width"]))
+
+    results_df = run_sweep(
+        df, model, feature_cols,
+        intraday_df=intraday_df,
+        options_pricing=options_pricing,
+        n_workers=args.workers,
+    )
 
     # Save raw results
     out_path = RESULTS_DIR / "sweep.parquet"

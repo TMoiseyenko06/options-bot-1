@@ -240,6 +240,7 @@ def run_backtest(
     direction_threshold: float = 0.002,
     vix_filter: float | None = None,
     intraday_df: pd.DataFrame | None = None,
+    options_pricing: dict | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """
     Core backtest loop. Returns (trade_log_df, summary_dict).
@@ -247,6 +248,12 @@ def run_backtest(
     intraday_df: 1-minute SPY bars (from spy_intraday_1m.parquet).
                  If provided, exits are simulated bar-by-bar.
                  If None, falls back to daily OHLCV approximation.
+
+    options_pricing: lookup dict from backtest.historical_options.load_options_cache().
+                     Keys are (date_str, contract_type, spread_width).
+                     When a key is found, the actual API debit/max_gain replaces the
+                     fixed 35% approximation for that trade.
+                     If None or key missing, falls back to the parametric debit/max_gain.
     """
     label_map = {-1: 0, 0: 1, 1: 2}
     df = df.copy()
@@ -281,6 +288,22 @@ def run_backtest(
             continue   # No trade
 
         trade_date = pd.Timestamp(row["date"]).normalize()
+
+        # ── Real options pricing (15-min delayed, from Massive API cache) ─────
+        # Look up actual debit and max_gain for this date/direction/width.
+        # Falls back to the parametric 35% approximation when not in cache.
+        contract_type = "call" if pred_direction == 1 else "put"
+        pricing_source = "35pct_approx"
+        trade_debit = debit
+        trade_max_gain = max_gain
+        if options_pricing is not None:
+            cache_key = (str(trade_date.date()), contract_type, int(spread_width))
+            cached = options_pricing.get(cache_key)
+            if cached is not None:
+                trade_debit = cached["debit_dollars"]
+                trade_max_gain = cached["max_gain_dollars"]
+                pricing_source = "api_real"
+
         day_bars = intraday_by_date.get(trade_date)
 
         if day_bars is not None and not day_bars.empty:
@@ -303,12 +326,12 @@ def run_backtest(
 
             pnl, exit_type, hold_hours = _simulate_exit_minute_bars(
                 day_bars, entry_price, pred_direction,
-                debit, max_gain, profit_target_pct, stop_loss_pct,
+                trade_debit, trade_max_gain, profit_target_pct, stop_loss_pct,
             )
         else:
             # Daily fallback
             pnl, exit_type, hold_hours = _simulate_exit_daily_fallback(
-                row, pred_direction, debit, max_gain,
+                row, pred_direction, trade_debit, trade_max_gain,
                 profit_target_pct, stop_loss_pct,
             )
 
@@ -319,8 +342,8 @@ def run_backtest(
             "date": row["date"],
             "direction": pred_direction,
             "spread_type": spread_type,
-            "entry_debit": debit,
-            "exit_value": debit + pnl,
+            "entry_debit": trade_debit,
+            "exit_value": trade_debit + pnl,
             "pnl": pnl,
             "win": int(pnl > 0),
             "hold_hours": hold_hours,
@@ -328,6 +351,7 @@ def run_backtest(
             "confidence": confidence,
             "vix_level": _get_price(row, ["vix_level", "vix_close"]) or np.nan,
             "day_of_week": int(row.get("day_of_week", row["date"].dayofweek)),
+            "pricing_source": pricing_source,
         })
 
     trade_log = pd.DataFrame(trades)
@@ -399,6 +423,11 @@ def _compute_summary(trade_log: pd.DataFrame) -> dict:
     # Exit type breakdown
     exit_counts = trade_log["exit_type"].value_counts().to_dict()
 
+    # Options pricing source breakdown (api_real vs 35pct_approx)
+    pricing_source_counts = {}
+    if "pricing_source" in trade_log.columns:
+        pricing_source_counts = trade_log["pricing_source"].value_counts().to_dict()
+
     return {
         "total_trades": n,
         "win_rate": float(wins / n),
@@ -411,6 +440,7 @@ def _compute_summary(trade_log: pd.DataFrame) -> dict:
         "win_rate_by_vix_regime": {str(k): v for k, v in wr_vix.items()},
         "win_rate_by_direction": {str(k): v for k, v in wr_dir.items()},
         "win_rate_by_month": {str(k): v for k, v in wr_month.items()},
+        "pricing_source_counts": pricing_source_counts,
     }
 
 
@@ -431,8 +461,17 @@ def main():
     else:
         print("  No spy_intraday_1m.parquet found — will use daily OHLCV fallback")
 
+    # ── Real options pricing via Massive API (15-min delayed, consistent with live) ──
+    print("[backtest] Loading real options pricing from Massive API …")
+    from backtest.historical_options import load_options_cache
+    options_pricing = load_options_cache(df, spread_widths=[SPREAD_WIDTH])
+
     print("\n[backtest] Running backtest …")
-    trade_log, summary = run_backtest(df, model, feature_cols, intraday_df=intraday_df)
+    trade_log, summary = run_backtest(
+        df, model, feature_cols,
+        intraday_df=intraday_df,
+        options_pricing=options_pricing,
+    )
 
     # ── Save results ──────────────────────────────────────────────────────────
     trade_log_path = RESULTS_DIR / "trade_log.parquet"
@@ -465,6 +504,11 @@ def main():
     print("\n  Exit type breakdown:")
     for etype, cnt in summary["exit_type_counts"].items():
         print(f"    {etype}: {cnt}")
+
+    if "pricing_source_counts" in summary:
+        print("\n  Options pricing source:")
+        for src, cnt in summary["pricing_source_counts"].items():
+            print(f"    {src}: {cnt}")
 
 
 if __name__ == "__main__":

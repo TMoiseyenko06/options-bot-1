@@ -108,6 +108,10 @@ def main():
     debit = spread_width * 0.35 * 100
     max_gain = spread_width * 100 - debit
 
+    # Load real options pricing (15-min delayed) for the best spread width
+    from backtest.historical_options import load_options_cache
+    options_pricing = load_options_cache(df, spread_widths=[spread_width])
+
     trade_log, summary = run_backtest(
         df,
         model,
@@ -120,6 +124,7 @@ def main():
         direction_threshold=float(best["direction_threshold"]),
         vix_filter=float(best["vix_filter"]),
         intraday_df=intraday_df,
+        options_pricing=options_pricing,
     )
 
     print(f"\n{'='*55}")
@@ -144,6 +149,11 @@ def main():
     print(f"\n  Exit type breakdown:")
     for etype, cnt in summary["exit_type_counts"].items():
         print(f"    {etype}: {cnt}")
+
+    if summary.get("pricing_source_counts"):
+        print(f"\n  Options pricing source:")
+        for src, cnt in summary["pricing_source_counts"].items():
+            print(f"    {src}: {cnt}")
 
     # Save best params for reference
     best_params_out = {
