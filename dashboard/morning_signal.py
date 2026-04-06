@@ -73,19 +73,36 @@ def _fetch_databento_live(symbol: str, dataset: str, schema: str, lookback: int 
     import databento as db  # import here to make dependency explicit
 
     client = db.Historical(DATABENTO_API_KEY)
-    # Databento OHLCV-1d lags by 1-2 days — cap end to yesterday to avoid 422
+
+    # End at the last weekday (Databento OHLCV-1d lags 1-2 days and
+    # rejects requests beyond the available cutoff with a 422).
     end_dt = datetime.utcnow().date() - timedelta(days=1)
+    if end_dt.weekday() == 5:    # Saturday → Friday
+        end_dt -= timedelta(days=1)
+    elif end_dt.weekday() == 6:  # Sunday → Friday
+        end_dt -= timedelta(days=2)
     start_dt = end_dt - timedelta(days=lookback)
 
-    print(f"  [API] Fetching {symbol} ({dataset}/{schema}) {start_dt} → {end_dt} …")
-    data = client.timeseries.get_range(
-        dataset=dataset,
-        symbols=[symbol],
-        schema=schema,
-        start=start_dt.isoformat(),
-        end=end_dt.isoformat(),
-    )
-    df = data.to_df()
+    # Retry with progressively earlier end dates if dataset isn't available yet
+    df = pd.DataFrame()
+    for attempt in range(4):
+        try_end = end_dt - timedelta(days=attempt)
+        print(f"  [API] Fetching {symbol} ({dataset}/{schema}) {start_dt} → {try_end} …")
+        try:
+            data = client.timeseries.get_range(
+                dataset=dataset,
+                symbols=[symbol],
+                schema=schema,
+                start=start_dt.isoformat(),
+                end=try_end.isoformat(),
+            )
+            df = data.to_df()
+            break
+        except Exception as e:
+            if "422" in str(e) or "not_fully_available" in str(e):
+                print(f"  [API] {try_end} not available yet, trying earlier …")
+                continue
+            raise
     if df.empty:
         print(f"  [API] WARNING: No data returned for {symbol}")
         return pd.DataFrame()
