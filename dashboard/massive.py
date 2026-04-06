@@ -63,6 +63,24 @@ def _occ_ticker(underlying: str, expiry: date, contract_type: str, strike: float
 
 # ── Contract lookup ────────────────────────────────────────────────────────────
 
+def _occ_underlying(underlying: str, expiry: Optional[date] = None) -> str:
+    """
+    SPX 0DTE options are weekly contracts listed as SPXW in the OCC symbol.
+    Monthly SPX options (3rd Friday) use SPX. Weekly use SPXW.
+    We default to SPXW for SPX since we always trade 0DTE weeklies.
+    """
+    if underlying.upper() != "SPX":
+        return underlying
+    # Monthly expiry = 3rd Friday of the month
+    if expiry is not None:
+        first_day = expiry.replace(day=1)
+        first_friday = first_day + __import__("datetime").timedelta(days=(4 - first_day.weekday()) % 7)
+        third_friday = first_friday + __import__("datetime").timedelta(weeks=2)
+        if expiry == third_friday:
+            return "SPX"   # monthly contract
+    return "SPXW"
+
+
 def get_0dte_strikes(
     underlying: str,
     contract_type: str,
@@ -83,10 +101,13 @@ def get_0dte_strikes(
     if expiry is None:
         expiry = date.today()
 
+    # SPX 0DTE are weekly contracts → search under SPXW
+    search_underlying = _occ_underlying(underlying, expiry)
+
     # Fetch contracts near the money (within 50 points either side)
     if contract_type.lower() == "call":
         params = {
-            "underlying_ticker": underlying,
+            "underlying_ticker": search_underlying,
             "contract_type": "call",
             "expiration_date": expiry.isoformat(),
             "strike_price.gte": current_price,
@@ -97,7 +118,7 @@ def get_0dte_strikes(
         }
     else:
         params = {
-            "underlying_ticker": underlying,
+            "underlying_ticker": search_underlying,
             "contract_type": "put",
             "expiration_date": expiry.isoformat(),
             "strike_price.gte": current_price - 50,
@@ -168,9 +189,12 @@ def get_spread_pricing(
     if expiry is None:
         expiry = date.today()
 
-    long_ticker = _occ_ticker(underlying, expiry, contract_type, long_strike)
-    short_ticker = _occ_ticker(underlying, expiry, contract_type, short_strike)
+    # Use SPXW for weekly 0DTE contracts, SPX for monthly expiry
+    occ_sym = _occ_underlying(underlying, expiry)
+    long_ticker = _occ_ticker(occ_sym, expiry, contract_type, long_strike)
+    short_ticker = _occ_ticker(occ_sym, expiry, contract_type, short_strike)
 
+    print(f"[massive] OCC symbol: {occ_sym}  (underlying path: {underlying})")
     print(f"[massive] Fetching long leg  : {long_ticker}")
     long_snap = get_contract_snapshot(underlying, long_ticker)
 
