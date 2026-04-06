@@ -73,7 +73,8 @@ def _fetch_databento_live(symbol: str, dataset: str, schema: str, lookback: int 
     import databento as db  # import here to make dependency explicit
 
     client = db.Historical(DATABENTO_API_KEY)
-    end_dt = datetime.utcnow().date()
+    # Databento OHLCV-1d lags by 1-2 days — cap end to yesterday to avoid 422
+    end_dt = datetime.utcnow().date() - timedelta(days=1)
     start_dt = end_dt - timedelta(days=lookback)
 
     print(f"  [API] Fetching {symbol} ({dataset}/{schema}) {start_dt} → {end_dt} …")
@@ -210,6 +211,10 @@ def build_today_features(
     raw_cols = [c for c in existing_features.columns if c not in FEATURE_COLUMNS
                 and c not in ("target", "target_idx", "spy_intraday_return")]
     existing_raw = existing_features[["date"] + [c for c in raw_cols if c in existing_features.columns]]
+
+    # Deduplicate columns before concat (duplicate col names cause InvalidIndexError)
+    existing_raw = existing_raw.loc[:, ~existing_raw.columns.duplicated()]
+    new_rows = new_rows.loc[:, ~new_rows.columns.duplicated()]
 
     combined = pd.concat([existing_raw, new_rows], ignore_index=True)
     combined["date"] = pd.to_datetime(combined["date"])
