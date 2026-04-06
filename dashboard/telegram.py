@@ -116,7 +116,8 @@ def format_signal_message(result: dict) -> str:
         lines.append("")
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         lines.append(f"<b>TRADE TICKET</b>")
-        lines.append(f"  {p['underlying']} @ {p['underlying_price']:.2f}")
+        price_str = f"@ {p['underlying_price']:.2f}" if p['underlying_price'] is not None else "(price unavailable)"
+        lines.append(f"  {p['underlying']} {price_str}")
         lines.append(f"  {p['contract_type'].upper()} DEBIT SPREAD  |  0DTE")
         lines.append(f"  Long:  <code>{p['long_strike']:.0f}</code>  ({p['long_ticker']})")
         lines.append(f"  Short: <code>{p['short_strike']:.0f}</code>  ({p['short_ticker']})")
