@@ -406,7 +406,8 @@ def print_signal(result: dict):
         print(f"\n  {line2}")
         print(f"  TRADE TICKET")
         print(f"  {line2}")
-        print(f"    Underlying    : {pricing['underlying']}  @ {pricing['underlying_price']:.2f}")
+        price_str = f"@ {pricing['underlying_price']:.2f}" if pricing['underlying_price'] is not None else "(price unavailable)"
+        print(f"    Underlying    : {pricing['underlying']}  {price_str}")
         print(f"    Type          : {pricing['contract_type'].upper()} DEBIT SPREAD")
         print(f"    Long strike   : {pricing['long_strike']:.0f}  ({pricing['long_ticker']})")
         print(f"    Short strike  : {pricing['short_strike']:.0f}  ({pricing['short_ticker']})")
