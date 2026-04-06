@@ -1,0 +1,40 @@
+services:
+  options-bot:
+    build: .
+    env_file: .env                          # loads MASSIVE_API_KEY, DATABENTO_API_KEY, etc.
+    volumes:
+      - ./data:/app/data                    # raw + processed data (large, not in image)
+      - ./models:/app/models                # trained model files
+      - ./backtest/results:/app/backtest/results
+      - ./grid_search/results:/app/grid_search/results
+    command: python backtest/engine.py      # override for other scripts (see below)
+
+  # ── individual scripts ──────────────────────────────────────────────────────
+  pipeline:
+    build: .
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./backtest/results:/app/backtest/results
+      - ./grid_search/results:/app/grid_search/results
+    command: bash run_pipeline.sh
+
+  signal:
+    build: .
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./dashboard:/app/dashboard         # so last_signal.json writes back to host
+    command: python dashboard/morning_signal.py
+
+  sweep:
+    build: .
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./backtest/results:/app/backtest/results
+      - ./grid_search/results:/app/grid_search/results
+    command: python grid_search/sweep.py
