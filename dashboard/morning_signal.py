@@ -195,6 +195,13 @@ def build_today_features(
     vix_df = vix_df.copy()
     sectors_df = sectors_df.copy()
 
+    # Strip timezone info so all date columns are tz-naive before merging
+    for _df in [spy_df, es_df, vix_df, sectors_df]:
+        if "date" in _df.columns:
+            _df["date"] = pd.to_datetime(_df["date"])
+            if _df["date"].dt.tz is not None:
+                _df["date"] = _df["date"].dt.tz_localize(None)
+
     # Rename columns to match existing schema
     spy_df = spy_df.rename(columns={c: f"spy_{c}" for c in spy_df.columns if c != "date"})
     es_df = es_df.rename(columns={c: f"es_{c}" for c in es_df.columns if c != "date"})
@@ -252,8 +259,12 @@ def build_today_features(
 
 # ── Signal generation ─────────────────────────────────────────────────────────
 
-def generate_signal(today_row: pd.DataFrame, model: xgb.XGBClassifier, feature_cols: list[str]) -> dict:
-    """Run prediction and compute SHAP for today's features."""
+def generate_signal(today_row: pd.DataFrame, model: xgb.XGBClassifier, feature_cols: list[str], force_directional: bool = False) -> dict:
+    """Run prediction and compute SHAP for today's features.
+
+    force_directional: if True, ignores FLAT prediction and picks whichever
+    of UP/DOWN has the higher probability. Useful for testing the pipeline.
+    """
     available = [c for c in feature_cols if c in today_row.columns]
     X = today_row[available].values.astype(np.float32)
 
@@ -261,6 +272,12 @@ def generate_signal(today_row: pd.DataFrame, model: xgb.XGBClassifier, feature_c
     pred_class = int(np.argmax(proba))
     pred_direction = LABEL_INV[pred_class]
     confidence = float(proba[pred_class])
+
+    # --force-directional: if model says FLAT, pick whichever of UP/DOWN is more likely
+    if force_directional and pred_direction == 0:
+        pred_direction = 1 if proba[2] >= proba[0] else -1
+        pred_class = 2 if pred_direction == 1 else 0
+        confidence = float(proba[pred_class])
 
     # SHAP for today
     explainer = shap.TreeExplainer(model)
@@ -297,7 +314,7 @@ def generate_signal(today_row: pd.DataFrame, model: xgb.XGBClassifier, feature_c
         active_filters.append(f"CPI release today — signal suppressed")
         signal_override = True
 
-    final_direction = 0 if signal_override else pred_direction
+    final_direction = 0 if (signal_override and not force_directional) else pred_direction
 
     vix_col = _find_col(today_row, ["vix_level", "vix_close", "vix_vix_close"], required=False)
     vix9d_col = _find_col(today_row, ["vix9d_minus_vix", "vix9d_close"], required=False)
@@ -417,7 +434,18 @@ def print_signal(result: dict):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="0DTE SPX morning signal dashboard")
+    parser.add_argument(
+        "--force-directional", action="store_true",
+        help="Ignore FLAT prediction and FOMC/CPI filters — output best directional signal (UP or DOWN). "
+             "Useful for testing the full signal pipeline.",
+    )
+    args = parser.parse_args()
+
     print("[morning_signal] Starting morning signal dashboard …")
+    if args.force_directional:
+        print("[morning_signal] --force-directional: FLAT suppression and event filters are DISABLED")
 
     # Verify API key
     if not DATABENTO_API_KEY:
@@ -509,7 +537,7 @@ def main():
 
     # Generate signal
     print("[morning_signal] Generating signal …")
-    result = generate_signal(today_features, model, feature_cols)
+    result = generate_signal(today_features, model, feature_cols, force_directional=args.force_directional)
 
     # Fetch real options pricing via Massive API (only if signal is directional)
     result["options_pricing"] = None
