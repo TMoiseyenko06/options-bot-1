@@ -206,25 +206,24 @@ def build_today_features(
     spy_df = spy_df.rename(columns={c: f"spy_{c}" for c in spy_df.columns if c != "date"})
     es_df = es_df.rename(columns={c: f"es_{c}" for c in es_df.columns if c != "date"})
 
-    # Align VIX columns
+    # Align VIX columns.
+    # yfinance MultiIndex flattens to "{metric}_{ticker}", e.g. "close_^vix".
+    # We want "{normalized_ticker}_{metric}", e.g. "vix_close".
     for col in list(vix_df.columns):
-        if col != "date":
-            ticker = col.split("_")[0] if "_" in col else "vix"
-            suffix = col.split("_", 1)[1] if "_" in col else col
-            # Map ^VIX → vix_, ^VIX9D → vix9d_
-            if "vix9d" in col.lower() or "^vix9d" in col.lower():
-                vix_df = vix_df.rename(columns={col: f"vix9d_{suffix}"})
-            elif "vix" in col.lower():
-                vix_df = vix_df.rename(columns={col: f"vix_{suffix}"})
+        if col != "date" and "_" in col:
+            metric, ticker_raw = col.split("_", 1)
+            if "vix9d" in ticker_raw.lower():
+                vix_df = vix_df.rename(columns={col: f"vix9d_{metric}"})
+            elif "vix" in ticker_raw.lower():
+                vix_df = vix_df.rename(columns={col: f"vix_{metric}"})
 
-    # Align sector columns
+    # Align sector columns: "close_xlk" → "xlk_close"
     for ticker in ["xlk", "xlf", "xle", "xlv"]:
         for col in list(sectors_df.columns):
-            if col != "date" and ticker in col.lower() and not col.startswith(f"{ticker}_"):
-                new_col = col.lower().replace(f"^{ticker}", ticker).replace(ticker, f"{ticker}", 1)
-                if not new_col.startswith(f"{ticker}_"):
-                    new_col = f"{ticker}_{col.split('_', 1)[-1]}" if "_" in col else f"{ticker}_{col}"
-                sectors_df = sectors_df.rename(columns={col: new_col})
+            if col != "date" and "_" in col and ticker in col.lower():
+                metric, ticker_raw = col.split("_", 1)
+                if ticker in ticker_raw.lower() and not col.startswith(f"{ticker}_"):
+                    sectors_df = sectors_df.rename(columns={col: f"{ticker}_{metric}"})
 
     # Merge all onto date
     new_rows = spy_df.merge(es_df, on="date", how="left")
@@ -244,11 +243,22 @@ def build_today_features(
     combined["date"] = pd.to_datetime(combined["date"])
     combined = combined.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
 
-    # Compute overnight gap for ES if available
+    # Compute overnight gap: ES futures preferred, SPY open vs prior close as fallback.
+    # ES fetch often fails (symbol resolution) so the last row's es_open/es_close
+    # may be NaN — in that case SPY gap is a reliable substitute.
+    spy_close_col = next((c for c in combined.columns if c == "spy_close"), None)
+    spy_open_col = next((c for c in combined.columns if c == "spy_open"), None)
+
     if "es_close" in combined.columns and "es_open" in combined.columns:
-        combined["es_overnight_gap"] = (
-            (combined["es_open"] - combined["es_close"].shift(1)) / combined["es_close"].shift(1)
-        )
+        es_gap = (combined["es_open"] - combined["es_close"].shift(1)) / combined["es_close"].shift(1)
+    else:
+        es_gap = pd.Series(float("nan"), index=combined.index)
+
+    if spy_close_col and spy_open_col:
+        spy_gap = (combined[spy_open_col] - combined[spy_close_col].shift(1)) / combined[spy_close_col].shift(1)
+        combined["es_overnight_gap"] = es_gap.fillna(spy_gap)
+    else:
+        combined["es_overnight_gap"] = es_gap
 
     # Re-engineer features
     combined = engineer_features(combined)
