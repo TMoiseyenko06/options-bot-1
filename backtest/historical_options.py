@@ -239,62 +239,10 @@ def fetch_spread_pricing(
     print(f"[pricing]   long  → {long_ticker}")
     print(f"[pricing]   short → {short_ticker}")
 
-    if MASSIVE_API_KEY:
-        c = _client()
-
-        # ── Attempt 1: /v3/quotes ──────────────────────────────────────────────
-        long_quote = _fetch_quote_at_930(c, long_ticker, trade_date)
-        short_quote = _fetch_quote_at_930(c, short_ticker, trade_date)
-
-        if long_quote and short_quote:
-            long_ask = long_quote[1]    # (bid, ask)
-            short_bid = short_quote[0]
-            print(f"[pricing]   quotes — long_ask={long_ask}  short_bid={short_bid}")
-            debit_ps = long_ask - short_bid
-            if debit_ps > 0:
-                debit_d = debit_ps * SPX_MULTIPLIER
-                max_gain_d = spread_width * SPX_MULTIPLIER - debit_d
-                if max_gain_d > 0:
-                    print(f"[pricing]   ✓ quotes  debit=${debit_d:.2f}  max_gain=${max_gain_d:.2f}")
-                    return {
-                        "debit_dollars": round(debit_d, 2),
-                        "max_gain_dollars": round(max_gain_d, 2),
-                        "debit_per_share": round(debit_ps, 4),
-                        "long_strike": k_long,
-                        "short_strike": k_short,
-                        "source": "api_quotes",
-                    }
-                print(f"[pricing]   ✗ quotes max_gain<=0")
-            else:
-                print(f"[pricing]   ✗ quotes debit<=0 (long_ask={long_ask} short_bid={short_bid})")
-        else:
-            print(f"[pricing]   quotes incomplete — trying agg bars")
-
-        # ── Attempt 2: /v2/aggs 1-min bars ────────────────────────────────────
-        long_close = _fetch_agg_at_930(c, long_ticker, trade_date)
-        short_close = _fetch_agg_at_930(c, short_ticker, trade_date)
-        print(f"[pricing]   aggs — long_close={long_close}  short_close={short_close}")
-
-        if long_close is not None and short_close is not None:
-            debit_ps = long_close - short_close
-            if debit_ps > 0:
-                debit_d = debit_ps * SPX_MULTIPLIER
-                max_gain_d = spread_width * SPX_MULTIPLIER - debit_d
-                if max_gain_d > 0:
-                    print(f"[pricing]   ✓ aggs   debit=${debit_d:.2f}  max_gain=${max_gain_d:.2f}")
-                    return {
-                        "debit_dollars": round(debit_d, 2),
-                        "max_gain_dollars": round(max_gain_d, 2),
-                        "debit_per_share": round(debit_ps, 4),
-                        "long_strike": k_long,
-                        "short_strike": k_short,
-                        "source": "api_aggs",
-                    }
-                print(f"[pricing]   ✗ aggs max_gain<=0")
-            else:
-                print(f"[pricing]   ✗ aggs debit<=0")
-    else:
-        print(f"[pricing]   no MASSIVE_API_KEY — skipping API")
+    # Historical options quotes/aggs require a paid plan upgrade on Massive.
+    # For backtesting we skip straight to Black-Scholes — the live signal
+    # still uses the snapshot endpoint (current-day data) which IS included.
+    print(f"[pricing]   skipping API for historical date — using Black-Scholes")
 
     # ── Attempt 3: Black-Scholes with VIX ─────────────────────────────────────
     if vix is not None and vix > 0:
@@ -381,8 +329,7 @@ def _build_cache(
                     fb += 1
                     print(f"[build_cache]   RESULT  source=35pct_fallback")
 
-                if MASSIVE_API_KEY:
-                    time.sleep(api_delay_seconds)
+                pass  # no API calls for historical data — no rate limit delay needed
 
     print(
         f"\n[historical_options] Cache complete: "
