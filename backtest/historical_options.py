@@ -441,6 +441,7 @@ def load_options_cache(
         lookup[key] = {
             "debit_dollars": float(row["debit_dollars"]),
             "max_gain_dollars": float(row["max_gain_dollars"]),
+            "source": str(row.get("source", "unknown")),
         }
 
     total_slots = len(needed_dates) * len(spread_widths) * 2

@@ -304,7 +304,7 @@ def run_backtest(
             if cached is not None:
                 trade_debit = cached["debit_dollars"]
                 trade_max_gain = cached["max_gain_dollars"]
-                pricing_source = "api_real"
+                pricing_source = cached.get("source", "unknown")
             else:
                 print(
                     f"[backtest] {trade_date.date()} {contract_type}: "
